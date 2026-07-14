@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import unittest
 
@@ -511,6 +512,7 @@ class TestFullCycleAndAdopt(unittest.TestCase):
                 self.assertIn("answer", f.read().lower())
 
 
+
 class TestHermesBackendCli(unittest.TestCase):
     """Hermes Sleep CLI backend: command construction, error capture, output filtering."""
 
@@ -689,6 +691,278 @@ class TestHermesBackendCli(unittest.TestCase):
             be = HermesBackend(timeout=5)
             self.assertEqual(be.hermes_bin, "hermes")
             self.assertEqual(be.hermes_profile, "default")
+
+class TestHermesHarvest(unittest.TestCase):
+    """Hermes session harvesting: DB queries, filtering, redaction, feedback."""
+
+    def _create_state_db(self, tmp: str) -> str:
+        """Create a minimal Hermes state.db with one test session."""
+        import sqlite3
+        db = os.path.join(tmp, "state.db")
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, title TEXT, "
+            "started_at REAL, ended_at REAL, model TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, "
+            "role TEXT, content TEXT, tool_name TEXT, timestamp REAL)"
+        )
+        return db
+
+    def test_harvest_returns_empty_when_no_db(self):
+        """No state.db file → harvest_hermes returns []."""
+        from skillopt_sleep.harvest_hermes import harvest_hermes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            result = harvest_hermes(db_path=os.path.join(tmp, "nonexistent.db"))
+        self.assertEqual(result, [])
+
+    def test_harvest_filters_engine_sessions(self):
+        """Sessions with 'skillopt_sleep_hermes_' in cwd are excluded."""
+        from skillopt_sleep.harvest_hermes import harvest_hermes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._create_state_db(tmp)
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                ("engine-s1", f"/tmp/skillopt_sleep_hermes_abc", 1000.0, 2000.0),
+            )
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                ("real-s1", "/home/user/project", 1000.0, 2000.0),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("real-s1", "user", "hello"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("real-s1", "assistant", "hi"),
+            )
+            conn.commit()
+            conn.close()
+
+            digests = harvest_hermes(db_path=db)
+
+        self.assertEqual(len(digests), 1)
+        self.assertEqual(digests[0].session_id, "real-s1")
+
+    def test_harvest_includes_tool_messages(self):
+        """Tool-role messages are included and their tool_name is tracked."""
+        from skillopt_sleep.harvest_hermes import harvest_hermes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._create_state_db(tmp)
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                ("s1", "/p", 1000.0, 2000.0),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "user", "search the web"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_name) VALUES (?, ?, ?, ?)",
+                ("s1", "assistant", "I will use search", ""),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content, tool_name) VALUES (?, ?, ?, ?)",
+                ("s1", "tool", '{"result": "found 42"}', "search"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "assistant", "The answer is 42"),
+            )
+            conn.commit()
+            conn.close()
+
+            digests = harvest_hermes(db_path=db)
+
+        self.assertEqual(len(digests), 1)
+        self.assertIn("search", digests[0].tools_used)
+        # Tool content should not be counted as user/assistant turns
+        self.assertEqual(digests[0].n_user_turns, 1)
+        self.assertEqual(digests[0].n_assistant_turns, 2)
+
+    def test_harvest_detects_feedback(self):
+        """User messages containing positive/negative feedback are flagged."""
+        from skillopt_sleep.harvest_hermes import harvest_hermes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._create_state_db(tmp)
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                ("s1", "/p", 1000.0, 2000.0),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "user", "fix the parser"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "assistant", "fixed it"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "user", "still broken, please fix properly"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "assistant", "ok now really fixed"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "user", "perfect, thanks"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "assistant", "you're welcome"),
+            )
+            conn.commit()
+            conn.close()
+
+            digests = harvest_hermes(db_path=db)
+
+        self.assertEqual(len(digests), 1)
+        self.assertTrue(
+            any(s.startswith("neg:") for s in digests[0].feedback_signals),
+            f"expected negative feedback, got {digests[0].feedback_signals}",
+        )
+        self.assertTrue(
+            any(s.startswith("pos:") for s in digests[0].feedback_signals),
+            f"expected positive feedback, got {digests[0].feedback_signals}",
+        )
+
+    def test_harvest_redacts_secrets(self):
+        """API keys and tokens are redacted from user prompts."""
+        from skillopt_sleep.harvest_hermes import harvest_hermes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._create_state_db(tmp)
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                ("s1", "/p", 1000.0, 2000.0),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "user", "use key sk-abc123def456ghi789jkl"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "assistant", "ok"),
+            )
+            conn.commit()
+            conn.close()
+
+            digests = harvest_hermes(db_path=db)
+
+        self.assertEqual(len(digests), 1)
+        joined = " ".join(digests[0].user_prompts)
+        self.assertIn("[REDACTED_OPENAI_KEY]", joined)
+        self.assertNotIn("sk-abc123def456ghi789jkl", joined)
+
+    def test_harvest_limit_zero_is_unlimited(self):
+        """limit=0 returns all matching sessions, not capped at 200."""
+        from skillopt_sleep.harvest_hermes import harvest_hermes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._create_state_db(tmp)
+            conn = sqlite3.connect(db)
+            for i in range(5):
+                sid = f"s{i}"
+                conn.execute(
+                    "INSERT INTO sessions (id, cwd, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                    (sid, f"/p/{i}", 1000.0, 2000.0 + i),
+                )
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                    (sid, "user", f"task {i}"),
+                )
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                    (sid, "assistant", f"done {i}"),
+                )
+            conn.commit()
+            conn.close()
+
+            digests = harvest_hermes(db_path=db, limit=0)
+
+        self.assertEqual(len(digests), 5)
+
+    def test_harvest_respects_explicit_limit(self):
+        """An explicit limit caps the number of returned digests."""
+        from skillopt_sleep.harvest_hermes import harvest_hermes
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = self._create_state_db(tmp)
+            conn = sqlite3.connect(db)
+            for i in range(5):
+                sid = f"s{i}"
+                conn.execute(
+                    "INSERT INTO sessions (id, cwd, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                    (sid, f"/p/{i}", 1000.0, 2000.0 + i),
+                )
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                    (sid, "user", f"task {i}"),
+                )
+                conn.execute(
+                    "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                    (sid, "assistant", f"done {i}"),
+                )
+            conn.commit()
+            conn.close()
+
+            digests = harvest_hermes(db_path=db, limit=2)
+
+        self.assertEqual(len(digests), 2)
+
+    def test_harvest_sources_forwards_hermes_source(self):
+        """harvest_for_config with transcript_source='hermes' routes to harvest_hermes."""
+        from skillopt_sleep.config import load_config
+        from skillopt_sleep.harvest_sources import harvest_for_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            # Create a minimal state.db
+            db = os.path.join(tmp, "state.db")
+            conn = sqlite3.connect(db)
+            conn.execute(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, title TEXT, "
+                "started_at REAL, ended_at REAL, model TEXT)"
+            )
+            conn.execute(
+                "CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, "
+                "role TEXT, content TEXT, tool_name TEXT, timestamp REAL)"
+            )
+            conn.execute(
+                "INSERT INTO sessions (id, cwd, started_at, ended_at) VALUES (?, ?, ?, ?)",
+                ("s1", "/project", 1000.0, 2000.0),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "user", "hello"),
+            )
+            conn.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                ("s1", "assistant", "world"),
+            )
+            conn.commit()
+            conn.close()
+
+            cfg = load_config(
+                transcript_source="hermes",
+                hermes_home=tmp,
+                projects="all",
+            )
+            digests = harvest_for_config(cfg, limit=10)
+
+        self.assertEqual(len(digests), 1)
+        self.assertEqual(digests[0].session_id, "s1")
 
 
 if __name__ == "__main__":
