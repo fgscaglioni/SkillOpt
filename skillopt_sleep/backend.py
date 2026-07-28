@@ -1937,7 +1937,6 @@ class HermesBackend(CliBackend):
                 in_traceback = False
             body.append(line)
         result = "\n".join(body).strip()
-        self._tokens += len(prompt) // 4 + len(result) // 4
         return result
 
 
