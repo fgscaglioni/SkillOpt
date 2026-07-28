@@ -207,37 +207,6 @@ def reject(night: str = None) -> int:
     return 0
 
 
-def schedule_cmd(hour: int, minute: int) -> int:
-    """Install a nightly cron entry via the shared SkillOpt-Sleep scheduler.
-
-    Note: this schedules the shared engine (``python -m skillopt_sleep run``),
-    not the OpenClaw-specific ``run_sleep.py``.  Use ``run_sleep_cron.sh`` if
-    you need the OpenClaw-native backend and category task files instead.
-    """
-    try:
-        from skillopt_sleep.scheduler import schedule
-    except ImportError:
-        print("ERROR: skillopt_sleep.scheduler not available — is SkillOpt-Sleep installed?")
-        return 1
-    project = str(SKILL_DIR)
-    ok, msg = schedule(project, hour=hour, minute=minute)
-    print(msg)
-    return 0 if ok else 1
-
-
-def unschedule_cmd(all_projects: bool) -> int:
-    """Remove cron entry via the shared SkillOpt-Sleep scheduler."""
-    try:
-        from skillopt_sleep.scheduler import unschedule
-    except ImportError:
-        print("ERROR: skillopt_sleep.scheduler not available — is SkillOpt-Sleep installed?")
-        return 1
-    project = str(SKILL_DIR)
-    ok, msg = unschedule(project, all_projects=all_projects)
-    print(msg)
-    return 0 if ok else 1
-
-
 def cost() -> int:
     """Estimate per-night cost based on the actual measurement from Phase 2.
 
@@ -296,12 +265,6 @@ def main():
     p_reject = sub.add_parser("reject", help="discard most recent staging")
     p_reject.add_argument("night", nargs="?", default=None)
     sub.add_parser("cost", help="estimate cost")
-    p_schedule = sub.add_parser("schedule", help="install nightly cron entry")
-    p_schedule.add_argument("--hour", type=int, default=3, help="hour (0-23)")
-    p_schedule.add_argument("--minute", type=int, default=17, help="minute (0-59)")
-    p_unschedule = sub.add_parser("unschedule", help="remove cron entry")
-    p_unschedule.add_argument("--all", dest="all_projects", action="store_true",
-                               help="remove entries for all projects")
 
     args = ap.parse_args()
 
@@ -319,10 +282,6 @@ def main():
         return reject(args.night)
     if args.cmd == "cost":
         return cost()
-    if args.cmd == "schedule":
-        return schedule_cmd(args.hour, args.minute)
-    if args.cmd == "unschedule":
-        return unschedule_cmd(args.all_projects)
     return 1
 
 

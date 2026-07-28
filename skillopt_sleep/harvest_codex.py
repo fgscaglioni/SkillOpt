@@ -16,8 +16,28 @@ from skillopt_sleep.harvest import (
     _iter_jsonl,
     _project_matches,
 )
-from skillopt_sleep.staging import _SECRET_PATTERNS
 from skillopt_sleep.types import SessionDigest
+
+_SECRET_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"sk-[A-Za-z0-9_-]{10,}"), "[REDACTED_OPENAI_KEY]"),
+    (re.compile(r"(?i)(Authorization:\s*Bearer\s+)[^\s\"']+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)(Authorization:\s*Basic\s+)[^\s\"']+"), r"\1[REDACTED]"),
+    (
+        re.compile(r"(?i)\b(api[_-]?key|token|password|secret)\b(\s*[:=]\s*)[^\s\"']+"),
+        r"\1\2[REDACTED]",
+    ),
+    (
+        re.compile(r"(?i)\b(api[_-]?key|token|password|secret)\b(\s+)[^\s\"']+"),
+        r"\1\2[REDACTED]",
+    ),
+    (
+        re.compile(
+            r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
+            re.DOTALL,
+        ),
+        "[REDACTED_PRIVATE_KEY]",
+    ),
+)
 
 
 def _payload(rec: Dict[str, Any]) -> Dict[str, Any]:

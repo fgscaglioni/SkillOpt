@@ -24,7 +24,6 @@ cat <<EOF
 ${MIN} ${HOUR} * * *  "${RUNNER}" run --project "${PROJECT}" --scope invoked --backend ${BACKEND} >> "${PROJECT}/.skillopt-sleep/cron.log" 2>&1
 #
 # For fully-autonomous adoption (power users), append: --auto-adopt
-# To use the authenticated Claude CLI for model-driven optimization, set
-# BACKEND=claude above.
+# To spend real API budget for genuine lift, set BACKEND=anthropic above.
 # ────────────────────────────────────────────────────────────────────────────
 EOF

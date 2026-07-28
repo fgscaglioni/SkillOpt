@@ -35,16 +35,10 @@ _b._BACKENDS["openclaw-deepseek"] = OpenClawDeepSeekBackend
 # Patch get_backend to know about our backend
 _orig_get_backend = _b.get_backend
 
-def get_backend(name, model="", codex_path="", cursor_path="", project_dir=""):
+def get_backend(name, model="", codex_path=""):
     if name == "openclaw-deepseek":
         return OpenClawDeepSeekBackend(model=model or "deepseek-v4-pro")
-    return _orig_get_backend(
-        name,
-        model=model,
-        codex_path=codex_path,
-        cursor_path=cursor_path,
-        project_dir=project_dir,
-    )
+    return _orig_get_backend(name, model=model, codex_path=codex_path)
 
 _b.get_backend = get_backend
 

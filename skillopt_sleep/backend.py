@@ -24,16 +24,9 @@ import json
 import os
 import re
 import subprocess
-import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 
 from skillopt_sleep.types import EditRecord, ReplayResult, TaskRecord
-
-# On Windows, console-attached children (cmd.exe shims, python) allocate a
-# visible console window when the parent has none — a nightly cycle making
-# hundreds of CLI calls strobes cmd windows and steals focus from the user.
-# CREATE_NO_WINDOW suppresses that; harmless 0 elsewhere.
-_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
 
 
 def skill_hash(content: str) -> str:
@@ -47,11 +40,6 @@ class Backend:
     name = "base"
     # Optional user preferences (free text) injected into reflect as a prior.
     preferences: str = ""
-    # Optional per-night evidence log (skillopt_sleep.evidence.EvidenceLog).
-    # Attached by the cycle; None => no observability overhead. The phase tag
-    # labels which consolidation step subsequent replay calls belong to.
-    evidence = None
-    evidence_phase: str = ""
 
     def attempt(self, task: TaskRecord, skill: str, memory: str,
                 sample_id: int = 0) -> str:
@@ -335,23 +323,11 @@ class CliBackend(Backend):
         raise NotImplementedError
 
     def _cached_call(self, key: str, prompt: str, *, max_tokens: int = 1024) -> str:
-        kind = key.split(":", 1)[0]
-        ev = getattr(self, "evidence", None)
         if key in self._cache:
-            # cache hits log key-only (the full text is on the original miss event)
-            if ev is not None:
-                ev.log("replay", "model_call", kind=kind, cache_hit=True, key=key,
-                       phase=getattr(self, "evidence_phase", ""), backend=self.name,
-                       model=self.model)
             return self._cache[key]
         out = self._call(prompt, max_tokens=max_tokens)
         self._tokens += len(prompt) // 4 + len(out) // 4
         self._cache[key] = out
-        if ev is not None:
-            ev.log("replay", "model_call", kind=kind, cache_hit=False, key=key,
-                   phase=getattr(self, "evidence_phase", ""), backend=self.name,
-                   model=self.model, prompt=prompt, response=out,
-                   error=getattr(self, "last_call_error", "") or "")
         return out
 
     # operations -----------------------------------------------------------
@@ -380,15 +356,16 @@ class CliBackend(Backend):
             return self._cached_call(key, prompt, max_tokens=512)
         # generic path (mined daily-case tasks): neutral, content-filter-safe
         # wording. Apply the skill/memory as guidance, not as adversarial
-        # "OVERRIDE everything" directives. Template lives in the prompt
-        # registry so the dashboard can display/override it live.
-        from skillopt_sleep import prompts as prompt_registry
-        prompt = prompt_registry.render("attempt", {
-            "__SKILL__": skill or "(none)",
-            "__MEMORY__": memory or "(none)",
-            "__INTENT__": task.intent,
-            "__CONTEXT__": task.context_excerpt,
-        })
+        # "OVERRIDE everything" directives.
+        prompt = (
+            "Complete the following task for the user. Follow the skill and memory "
+            "guidance below, including any output-format and length requirements. "
+            "When a 'Learned preferences' rule sets an explicit limit (e.g. a length "
+            "cap), prefer that rule over more general advice it refines.\n\n"
+            f"# Skill\n{skill or '(none)'}\n\n# Memory\n{memory or '(none)'}\n\n"
+            f"# Task\n{task.intent}\n\n{task.context_excerpt}\n\n"
+            "Return ONLY the final answer text, nothing else."
+        )
         # cache on (task, skill, memory) so identical hold-out re-scoring is free
         salt = f"s{sample_id}:" if sample_id else ""
         key = "attempt:" + salt + skill_hash(prompt)
@@ -411,11 +388,11 @@ class CliBackend(Backend):
         if task.reference_kind == "exact" and task.reference:
             hard = exact_score(task.reference, response)
             return hard, max(hard, keyword_soft_score(task.reference, response)), "exact(local)"
-        from skillopt_sleep import prompts as prompt_registry
-        prompt = prompt_registry.render("judge", {
-            "__RUBRIC__": task.reference or task.intent,
-            "__RESPONSE__": response,
-        })
+        prompt = (
+            "Score how well the response satisfies the rubric, 0..1. "
+            'Return ONLY JSON {"score": <0..1>, "reason": "..."}.\n\n'
+            f"# Rubric\n{task.reference or task.intent}\n\n# Response\n{response}"
+        )
         key = "judge:" + skill_hash(prompt)
         raw = self._cached_call(key, prompt, max_tokens=200)
         obj = _extract_json(raw, "object")
@@ -498,20 +475,39 @@ class CliBackend(Backend):
         # can't ask questions). We surface the benchmark's own rollout system
         # prompt (carried on TaskRecord.system) so proposed rules stay in-bounds.
         guard_text = _task_guardrail(failures)
-        from skillopt_sleep import prompts as prompt_registry
-        prompt = prompt_registry.render("reflect", {
-            "__EDIT_BUDGET__": str(edit_budget),
-            "__TARGET__": target,
-            "__CUR_DOC__": cur_doc,
-            "__GUARD__": guard_text,
-            "__CRITERIA__": criteria_text,
-            "__PREFS__": pref_text,
-            "__FAILURES__": fail_text,
-        })
+        prompt = (
+            "You are SkillOpt's optimizer. The agent keeps failing the recurring "
+            f"tasks below. Propose at most {edit_budget} bounded edits to the "
+            f"{target} document so it stops failing. Each edit MUST be a short, "
+            "GENERAL, reusable rule or preference (never task-specific, never an "
+            "answer to a single task). If exact failing criteria are listed, your "
+            "edits MUST make future outputs satisfy every one of them.\n"
+            "BE CONCRETE: quote the exact threshold, section name, or format from "
+            "the criteria verbatim in your rule (e.g. write 'keep the entire "
+            "response under 1200 characters', NOT 'respect length limits'). Vague "
+            "rules do not change behavior; specific numeric/structural rules do.\n"
+            "IMPORTANT: your edits are APPENDED to a 'Learned preferences' block; "
+            "you CANNOT delete the existing instructions above. If the current "
+            f"{target} text conflicts with a criterion (e.g. it says 'be exhaustive' "
+            "but outputs must be under a character limit), write an explicit, "
+            "forceful OVERRIDE rule stating it supersedes the conflicting "
+            "instruction, and put the hard requirement first.\n"
+            "HARD CONSTRAINT: every rule you write MUST be consistent with the "
+            "'Task output contract' below (if shown). NEVER propose a rule that "
+            "changes the required output format/language, tells the agent to ask "
+            "the user a question, or otherwise violates that contract — such a "
+            "rule scores ZERO because the evaluator cannot honor it.\n"
+            'Return ONLY a JSON array: '
+            '[{"op":"add|replace|delete","content":"<rule>","anchor":"<text to replace/delete, optional>","rationale":"<why>"}].\n\n'
+            f"# Current {target}\n{cur_doc}\n"
+            f"{guard_text}"
+            f"{criteria_text}\n"
+            f"{pref_text}\n\n"
+            f"# Recurring failures\n{fail_text}"
+        )
         # Call with one retry: transient non-JSON replies otherwise waste a whole
         # night (the gate sees no edits and rejects). A firmer second prompt
         # recovers most of these.
-        ev = getattr(self, "evidence", None)
         arr = None
         for attempt in range(2):
             p = prompt if attempt == 0 else (
@@ -520,18 +516,10 @@ class CliBackend(Backend):
             )
             raw = self._call(p, max_tokens=1024)
             self._tokens += len(p) // 4 + len(raw) // 4
-            if ev is not None:
-                ev.log("reflect", "exchange", target=target, attempt=attempt + 1,
-                       backend=self.name, model=self.model,
-                       n_failures=len(failures), prompt=p, raw_reply=raw,
-                       error=getattr(self, "last_call_error", "") or "")
+            self.last_reflect_raw = raw or ""
             arr = _extract_json(raw, "array")
             if isinstance(arr, list) and arr:
                 break
-        # Expose the last raw optimizer reply so a no-edits night is diagnosable:
-        # a 0.0->0.0 gate with zero edits is otherwise indistinguishable from
-        # "nothing to learn" (the cycle persists this in diagnostics.json).
-        self.last_reflect_raw = raw or ""
         edits: List[EditRecord] = []
         if isinstance(arr, list):
             for e in arr[:edit_budget]:
@@ -563,45 +551,7 @@ class ClaudeCliBackend(CliBackend):
     def __init__(self, model: str = "", claude_path: str = "claude", timeout: int = 180) -> None:
         super().__init__(model=model or os.environ.get("SKILLOPT_SLEEP_CLAUDE_MODEL", "") or "sonnet",
                          timeout=timeout)
-        # On Windows the npm-installed `claude` is a .cmd shim; CreateProcess
-        # cannot resolve it by bare name (WinError 2), so every call would
-        # silently return "" and the whole cycle scores 0.0. shutil.which
-        # honors PATHEXT and returns the full claude.CMD path.
-        import shutil as _shutil
-        self.claude_path = _shutil.which(claude_path) or claude_path
-
-    # Known CLI error prefixes that indicate auth or config failures.
-    # When detected, we log a warning so the user doesn't mistake a
-    # broken auth for "nothing to optimize" (issue #68).
-    # Keep these specific to avoid false positives on normal model output.
-    _CLI_ERROR_MARKERS = (
-        "Not logged in",
-        "Please run /login",
-        "Authentication required",
-        "Invalid API key",
-        "Unauthorized: invalid x-api-key",
-    )
-
-    def _detect_cli_error(self, stdout: str, stderr: str) -> None:
-        """Log a warning if CLI output looks like an auth/config error.
-
-        Only checks stderr and short stdout (< 300 chars) to avoid
-        false-positives on legitimate model responses that mention
-        auth-related terms.
-        """
-        import logging
-        # Long stdout is almost certainly a real model response, not an error.
-        check_stdout = stdout if len(stdout) < 300 else ""
-        combined = check_stdout + "\n" + stderr
-        for marker in self._CLI_ERROR_MARKERS:
-            if marker in combined:
-                from skillopt_sleep.staging import redact_secrets
-                logging.getLogger("skillopt_sleep").warning(
-                    "Claude CLI returned a likely auth error: %s",
-                    redact_secrets(combined[:200].replace("\n", " ")),
-                )
-                self.last_call_error = combined[:500]
-                return
+        self.claude_path = claude_path
 
     def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
         # Run ISOLATED so the ambient Claude Code environment does not leak into
@@ -610,38 +560,27 @@ class ClaudeCliBackend(CliBackend):
         # them explicitly — without this, reflect/attempt sometimes reply with a
         # list of the user's installed skills instead of doing the task.
         #   --bare                    skip hooks, LSP, plugins (minimal mode)
-        #                             Only safe with ANTHROPIC_API_KEY auth;
-        #                             breaks subscription-token auth (#68).
         #   --disable-slash-commands  disable all skills
         #   --disallowedTools '*'     no tool use
         #   --exclude-dynamic-...     drop per-machine cwd/env/memory/git sections
         #   cwd=<clean temp>          no project CLAUDE.md
         import tempfile
-        cmd = [self.claude_path, "-p", "--output-format", "text"]
-        if os.environ.get("ANTHROPIC_API_KEY"):
-            cmd.append("--bare")
-        cmd += [
+        cmd = [
+            self.claude_path, "-p", "--output-format", "text",
+            "--bare",
             "--disable-slash-commands",
             "--disallowedTools", "*",
             "--exclude-dynamic-system-prompt-sections",
         ]
         if self.model:
             cmd += ["--model", self.model]
-        # Prompt goes via stdin, not argv: the Windows .cmd shim routes through
-        # cmd.exe whose command line caps at ~8K chars — reflect/judge prompts
-        # exceed that. `claude -p` with no positional prompt reads stdin.
+        cmd += ["--", prompt]
         clean_cwd = tempfile.mkdtemp(prefix="skillopt_sleep_claude_")
         try:
             proc = subprocess.run(
-                cmd, capture_output=True, creationflags=_NO_WINDOW, text=True, timeout=self.timeout, cwd=clean_cwd,
-                input=prompt,
+                cmd, capture_output=True, text=True, timeout=self.timeout, cwd=clean_cwd,
             )
-        except Exception as exc:
-            import logging
-            self.last_call_error = f"Claude CLI spawn failed: {exc}"
-            logging.getLogger("skillopt_sleep").warning(
-                "Claude CLI could not be executed: %s", exc,
-            )
+        except Exception:
             return ""
         finally:
             try:
@@ -649,9 +588,7 @@ class ClaudeCliBackend(CliBackend):
                 shutil.rmtree(clean_cwd, ignore_errors=True)
             except Exception:
                 pass
-        out = (proc.stdout or "").strip()
-        self._detect_cli_error(out, proc.stderr or "")
-        return out
+        return (proc.stdout or "").strip()
 
     def attempt_with_tools(self, task, skill, memory, tools):
         # Expose a REAL, callable `search` tool (a shell shim that logs each
@@ -688,29 +625,21 @@ class ClaudeCliBackend(CliBackend):
                 f"# Task\n{task.intent}\n\n{task.context_excerpt}\n\n"
                 "Return ONLY the final answer text."
             )
-            cmd = [self.claude_path, "-p", "--output-format", "text"]
-            if os.environ.get("ANTHROPIC_API_KEY"):
-                cmd.append("--bare")
-            cmd += [
-                "--disable-slash-commands",
+            cmd = [
+                self.claude_path, "-p", "--output-format", "text",
+                "--bare", "--disable-slash-commands",
                 "--allowedTools", "Bash",
                 "--exclude-dynamic-system-prompt-sections",
             ]
             if self.model:
                 cmd += ["--model", self.model]
+            cmd += ["--", prompt]
             try:
                 proc = subprocess.run(
-                    cmd, capture_output=True, creationflags=_NO_WINDOW, text=True, timeout=self.timeout, cwd=work,
-                    input=prompt,
+                    cmd, capture_output=True, text=True, timeout=self.timeout, cwd=work,
                 )
                 resp = (proc.stdout or "").strip()
-                self._detect_cli_error(resp, proc.stderr or "")
-            except Exception as exc:
-                import logging
-                self.last_call_error = f"Claude CLI spawn failed: {exc}"
-                logging.getLogger("skillopt_sleep").warning(
-                    "Claude CLI could not be executed: %s", exc,
-                )
+            except Exception:
                 resp = ""
             self._tokens += len(prompt) // 4 + len(resp) // 4
             called: List[str] = []
@@ -737,35 +666,14 @@ def resolve_codex_path(explicit: str = "") -> str:
     env = os.environ.get("SKILLOPT_SLEEP_CODEX_PATH")
     if env:
         return env
-    import sys
-    import shutil
-    candidates = []
-
-    # Try shutil.which("codex") first so PATH, pnpm, Volta, etc. work.
-    which_codex = shutil.which("codex")
-    if which_codex:
-        candidates.append(which_codex)
-
-    if sys.platform == "win32":
-        import ntpath
-        appdata = os.environ.get("APPDATA")
-        if appdata:
-            candidates.append(ntpath.join(appdata, "npm", "codex.cmd"))
-        userprofile = os.environ.get("USERPROFILE")
-        if userprofile:
-            candidates.append(ntpath.join(userprofile, "AppData", "Roaming", "npm", "codex.cmd"))
-            nvm_home = os.environ.get("NVM_HOME")
-            if nvm_home:
-                candidates.append(ntpath.join(nvm_home, "codex.cmd"))
-    else:
-        candidates.extend([
-            os.path.expanduser("~/.nvm/versions/node/v22.22.3/bin/codex"),
-        ])
-        # any nvm node version
-        nvm = os.path.expanduser("~/.nvm/versions/node")
-        if os.path.isdir(nvm):
-            for ver in sorted(os.listdir(nvm), reverse=True):
-                candidates.append(os.path.join(nvm, ver, "bin", "codex"))
+    candidates = [
+        os.path.expanduser("~/.nvm/versions/node/v22.22.3/bin/codex"),
+    ]
+    # any nvm node version
+    nvm = os.path.expanduser("~/.nvm/versions/node")
+    if os.path.isdir(nvm):
+        for ver in sorted(os.listdir(nvm), reverse=True):
+            candidates.append(os.path.join(nvm, ver, "bin", "codex"))
     for c in candidates:
         if not c or not os.path.exists(c):
             continue
@@ -778,7 +686,7 @@ def resolve_codex_path(explicit: str = "") -> str:
         except Exception:
             pass
         return c
-    return "codex"
+    return "codex"  # last resort (may be the wrapper)
 
 
 class CodexCliBackend(CliBackend):
@@ -786,26 +694,14 @@ class CodexCliBackend(CliBackend):
 
     name = "codex"
 
-    def __init__(
-        self,
-        model: str = "",
-        codex_path: str = "",
-        timeout: int = 240,
-        sandbox: str = "read-only",
-        project_dir: str = "",
-    ) -> None:
+    def __init__(self, model: str = "", codex_path: str = "", timeout: int = 240,
+                 sandbox: str = "read-only") -> None:
         super().__init__(model=model or os.environ.get("SKILLOPT_SLEEP_CODEX_MODEL", ""),
                          timeout=timeout)
         self.codex_path = resolve_codex_path(codex_path)
         self.sandbox = sandbox
-        self.project_dir = (
-            os.path.abspath(os.path.expanduser(project_dir)) if project_dir else ""
-        )
 
-    def _call_once(self, prompt: str, *, max_tokens: int = 1024) -> str:
-        """One codex exec attempt: returns the response text, or "" on
-        timeout/exception/empty-output (with last_call_error set). ``_call``
-        wraps this with retries so a transient failure is NOT silently scored 0."""
+    def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
         import tempfile
         out_path = tempfile.NamedTemporaryFile(
             prefix="codex_last_", suffix=".txt", delete=False
@@ -815,92 +711,23 @@ class CodexCliBackend(CliBackend):
             "--color", "never", "--sandbox", self.sandbox,
             "-o", out_path,
         ]
-        if self.project_dir:
-            cmd[3:3] = ["-C", self.project_dir]
         if self.model:
             cmd += ["-m", self.model]
         cmd += ["--", prompt]
-        proc = None
         try:
-            try:
-                proc = subprocess.run(
-                    cmd,
-                    capture_output=True,
-                    creationflags=_NO_WINDOW,
-                    text=True,
-                    timeout=self.timeout,
-                    cwd=self.project_dir or None,
-                )
-            except subprocess.TimeoutExpired:
-                self.last_call_error = f"codex exec timed out after {self.timeout}s"
-                return ""
-            except Exception as exc:
-                self.last_call_error = f"codex exec failed: {exc}"
-                return ""
-            try:
-                with open(out_path, encoding="utf-8") as f:
-                    out = f.read().strip()
-                if out:
-                    return out
-            except Exception as exc:
-                self.last_call_error = f"could not read codex output file: {exc}"
-            stdout = (proc.stdout or "").strip() if proc is not None else ""
-            stderr = (proc.stderr or "").strip() if proc is not None else ""
-            if proc is not None and proc.returncode != 0 and not self.last_call_error:
-                self.last_call_error = f"codex exec exited {proc.returncode}: {stderr[:500]}"
-            # Do NOT return the CLI's error text as if it were a model response: it
-            # pollutes rollout/judge/reflect and gets silently scored 0, hiding the
-            # real cause (e.g. an expired codex auth token surfacing as a 9k-char 401).
-            # Surface it via last_call_error and return empty instead.
-            if self.last_call_error:
-                return ""
-            return stdout or stderr
+            subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout)
+        except Exception:
+            return ""
+        try:
+            with open(out_path, encoding="utf-8") as f:
+                return f.read().strip()
+        except Exception:
+            return ""
         finally:
             try:
                 os.unlink(out_path)
             except Exception:
                 pass
-
-    # Fatal codex failures that will NOT recover on retry — fail fast + loud so a
-    # 0.0 night reads as "codex auth/model/version problem" not "nothing to learn".
-    # Covers: auth (re-login), and 400 config errors like an unsupported model on a
-    # ChatGPT account or a model that needs a newer codex CLI (upgrade).
-    _AUTH_MARKERS = (
-        "401 Unauthorized", "refresh_token_reused", "token_expired",
-        "Please log out and sign in", "Not logged in", "Please run /login",
-        "authentication token is expired", "Unauthorized: invalid",
-        "is not supported when using Codex", "requires a newer version of Codex",
-    )
-
-    def _call(self, prompt: str, *, max_tokens: int = 1024, retries: int = 3) -> str:
-        """Retry transient empties/timeouts instead of silently returning "".
-
-        An empty reply scores 0 on every judge, which deflates the held-out
-        baseline AND blocks the candidate from ever improving — making a flaky
-        backend indistinguishable from "nothing to learn". The Azure backend
-        already guards this way (AzureOpenAIBackend._call); codex now does too.
-        Auth errors are NOT retried (hopeless until the user re-logs-in).
-        """
-        import logging
-        import random as _r
-        import time as _t
-        out = ""
-        for attempt in range(max(1, retries)):
-            self.last_call_error = ""
-            out = self._call_once(prompt, max_tokens=max_tokens)
-            if out:
-                return out
-            err = self.last_call_error or ""
-            if any(m in err for m in self._AUTH_MARKERS):
-                from skillopt_sleep.staging import redact_secrets
-                logging.getLogger("skillopt_sleep").error(
-                    "codex auth error — re-login required (`codex login`): %s",
-                    redact_secrets(err[:200]),
-                )
-                break  # fail fast: retrying a 401 just burns calls
-            if attempt < retries - 1:
-                _t.sleep(min(6.0, (2 ** attempt) * 0.5) + _r.random() * 0.3)
-        return out
 
     def attempt_with_tools(self, task, skill, memory, tools):
         # Codex exec runs in a sandbox with shell access; expose the same real
@@ -909,45 +736,23 @@ class CodexCliBackend(CliBackend):
         work = tempfile.mkdtemp(prefix="skillopt_sleep_codextools_")
         calllog = os.path.join(work, "_tool_calls.log")
         out_path = os.path.join(work, "_last.txt")
-        tool_names = tools or ["search"]
-        is_windows = os.name == "nt"
         try:
-            for tname in tool_names:
-                if is_windows:
-                    shim = os.path.join(work, f"{tname}.cmd")
-                    with open(shim, "w") as f:
-                        f.write(
-                            "@echo off\n"
-                            f'echo %~n0>>"{calllog}"\n'
-                            "echo (search results: 3 relevant notes found; use them to answer)\n"
-                        )
-                else:
-                    shim = os.path.join(work, tname)
-                    with open(shim, "w") as f:
-                        f.write(
-                            "#!/usr/bin/env bash\n"
-                            f'echo "{tname}" >> "{calllog}"\n'
-                            'echo "(search results: 3 relevant notes found; use them to answer)"\n'
-                        )
-                    os.chmod(shim, os.stat(shim).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-            if is_windows:
-                tool_hint = (
-                    "Shell tools are available in the working directory: "
-                    + ", ".join(f"{t}.cmd" for t in tool_names)
-                    + " (each callable as `" + tool_names[0] + "` or `.\\"
-                    + tool_names[0] + "`). When the skill says to look something "
-                    "up or search before answering, you MUST actually run the "
-                    "tool (e.g. `" + tool_names[0] + " \"query\"`) before giving "
-                    "your final answer."
-                )
-            else:
-                tool_hint = (
-                    "Shell tools are available in the working directory: "
-                    + ", ".join(f"./{t}" for t in tool_names)
-                    + ". When the skill says to look something up or search before "
-                    "answering, you MUST actually run the tool (e.g. `./search \"query\"`) "
-                    "before giving your final answer."
-                )
+            for tname in (tools or ["search"]):
+                shim = os.path.join(work, tname)
+                with open(shim, "w") as f:
+                    f.write(
+                        "#!/usr/bin/env bash\n"
+                        f'echo "{tname}" >> "{calllog}"\n'
+                        'echo "(search results: 3 relevant notes found; use them to answer)"\n'
+                    )
+                os.chmod(shim, os.stat(shim).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+            tool_hint = (
+                "Shell tools are available in the working directory: "
+                + ", ".join(f"./{t}" for t in (tools or ["search"]))
+                + ". When the skill says to look something up or search before "
+                "answering, you MUST actually run the tool (e.g. `./search \"query\"`) "
+                "before giving your final answer."
+            )
             prompt = (
                 "Complete the task. Apply the skill and memory rules EXACTLY, "
                 "including any rule about searching before answering. Treat a "
@@ -963,27 +768,16 @@ class CodexCliBackend(CliBackend):
             if self.model:
                 cmd += ["-m", self.model]
             cmd += ["--", prompt]
-            self.last_call_error = ""
-            proc = None
             try:
-                proc = subprocess.run(cmd, capture_output=True, creationflags=_NO_WINDOW, text=True, timeout=self.timeout, cwd=work)
-            except subprocess.TimeoutExpired:
-                self.last_call_error = f"codex exec (tools) timed out after {self.timeout}s"
-            except Exception as exc:  # noqa: BLE001
-                self.last_call_error = f"codex exec (tools) failed: {exc}"
+                subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout, cwd=work)
+            except Exception:
+                pass
             resp = ""
             try:
                 with open(out_path, encoding="utf-8") as f:
                     resp = f.read().strip()
             except Exception:
                 resp = ""
-            # Surface a failed tool-rollout the SAME way _call does: an auth/model/version
-            # failure on this path must show up in diagnostics (call_error), not vanish as a
-            # silent empty->0 scored as a failed rollout. Response stays "" (never the error text).
-            if not resp and not self.last_call_error and proc is not None and proc.returncode != 0:
-                self.last_call_error = (
-                    f"codex exec (tools) exited {proc.returncode}: {(proc.stderr or '')[:500]}"
-                )
             self._tokens += len(prompt) // 4 + len(resp) // 4
             called: List[str] = []
             if os.path.exists(calllog):
@@ -996,473 +790,6 @@ class CodexCliBackend(CliBackend):
                 shutil.rmtree(work, ignore_errors=True)
             except Exception:
                 pass
-
-def resolve_copilot_path(explicit: str = "") -> str:
-    """Find the GitHub Copilot CLI (`copilot`) binary."""
-    if explicit:
-        return explicit
-    env = os.environ.get("SKILLOPT_SLEEP_COPILOT_PATH")
-    if env:
-        return env
-    import shutil
-    found = shutil.which("copilot")
-    return found or "copilot"
-
-
-def resolve_cursor_path(explicit: str = "") -> str:
-    """Find the Cursor Agent CLI (``cursor-agent``)."""
-    if explicit:
-        return os.path.expanduser(explicit)
-    env = os.environ.get("SKILLOPT_SLEEP_CURSOR_PATH")
-    if env:
-        return os.path.expanduser(env)
-    import shutil
-
-    found = shutil.which("cursor-agent")
-    return found or "cursor-agent"
-
-
-class CursorBackendError(RuntimeError):
-    """A redacted Cursor Agent process or response failure."""
-
-    def __init__(self, message: str, *, retryable: bool = False) -> None:
-        super().__init__(message)
-        self.retryable = retryable
-
-
-class CopilotCliBackend(CliBackend):
-    """Drives the GitHub Copilot CLI in non-interactive mode.
-
-    Uses ``copilot -p <prompt> --output-format json`` and parses the emitted
-    JSONL event stream, returning the concatenated ``assistant.message``
-    content. The plain-text / ``--silent`` modes do not reliably stream the
-    response to stdout on all platforms, so JSONL is used for robust capture.
-
-    The call runs in a clean temp cwd with streaming disabled and tools allowed
-    (so non-interactive mode never blocks on a permission prompt); ``_call``'s
-    prompts ask for final-answer text only, so no tool use is expected there,
-    while ``attempt_with_tools`` exposes real, cross-platform callable shims in
-    the working directory for honest tool-call detection.
-
-    Startup overhead is minimised: each invocation points ``COPILOT_HOME`` at a
-    dedicated, isolated config dir (no user ``mcp-config.json``, so the user's
-    MCP servers — including this project's own — are NOT spawned, avoiding a
-    slow recursive launch), and built-in MCP servers / custom instructions are
-    disabled. Auth is read from the OS credential store / token env vars, which
-    live outside ``COPILOT_HOME``, so isolation does not break authentication.
-    Set ``SKILLOPT_SLEEP_COPILOT_HOME`` to override the isolated home, or set it
-    empty / ``SKILLOPT_SLEEP_COPILOT_FULL_ENV=1`` to use the user's real
-    environment instead.
-    """
-
-    name = "copilot"
-
-    def __init__(self, model: str = "", copilot_path: str = "", timeout: int = 240) -> None:
-        super().__init__(model=model or os.environ.get("SKILLOPT_SLEEP_COPILOT_MODEL", ""),
-                         timeout=timeout)
-        self.copilot_path = resolve_copilot_path(copilot_path)
-        self.full_env = os.environ.get("SKILLOPT_SLEEP_COPILOT_FULL_ENV", "") == "1"
-        # Stable isolated home so first-run setup is cached across calls.
-        if self.full_env:
-            self.copilot_home = ""
-        else:
-            self.copilot_home = os.environ.get("SKILLOPT_SLEEP_COPILOT_HOME") or os.path.join(
-                tempfile.gettempdir(), "skillopt_sleep_copilot_home"
-            )
-            try:
-                os.makedirs(self.copilot_home, exist_ok=True)
-            except Exception:
-                self.copilot_home = ""
-
-    def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
-        clean_cwd = tempfile.mkdtemp(prefix="skillopt_sleep_copilot_")
-        cmd = [
-            self.copilot_path, "-p", prompt,
-            "--output-format", "json",
-            "--stream", "off",
-            "--no-color",
-            "--log-level", "none",
-            "--allow-all-tools",
-            "-C", clean_cwd,
-        ]
-        if not self.full_env:
-            # Drop unneeded startup work: no built-in (github) MCP server and no
-            # AGENTS.md / custom-instruction loading. With an isolated home that
-            # has no mcp-config.json, no user MCP servers spawn either.
-            cmd += ["--disable-builtin-mcps", "--no-custom-instructions"]
-        if self.model:
-            cmd += ["--model", self.model]
-        env = os.environ.copy()
-        if self.copilot_home:
-            env["COPILOT_HOME"] = self.copilot_home
-        try:
-            proc = subprocess.run(
-                cmd, capture_output=True, creationflags=_NO_WINDOW, text=True, timeout=self.timeout, cwd=clean_cwd,
-                encoding="utf-8", errors="replace", env=env,
-            )
-        except Exception:
-            return ""
-        finally:
-            try:
-                import shutil
-                shutil.rmtree(clean_cwd, ignore_errors=True)
-            except Exception:
-                pass
-        return self._parse_jsonl_response(proc.stdout or "")
-
-    @staticmethod
-    def _parse_jsonl_response(raw: str) -> str:
-        parts: List[str] = []
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line or not line.startswith("{"):
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            if obj.get("type") == "assistant.message":
-                content = (obj.get("data") or {}).get("content")
-                if isinstance(content, str) and content:
-                    parts.append(content)
-        return "\n".join(parts).strip()
-
-    def attempt_with_tools(self, task, skill, memory, tools):
-        # Expose REAL, callable tool shims in the working directory so the
-        # gbrain quick-answerer judge (tool_called=search) is validated
-        # honestly: we detect each call from the shim's log, not from a
-        # self-reported marker. The Copilot CLI is the Windows-validated
-        # backend, so the shims must be cross-platform — a bash `#!/usr/bin/env
-        # bash` + chmod shim does NOT execute via `./tool` under PowerShell/cmd,
-        # so on Windows we emit a `.cmd` batch shim instead.
-        import shutil
-        import stat
-        work = tempfile.mkdtemp(prefix="skillopt_sleep_copilottools_")
-        calllog = os.path.join(work, "_tool_calls.log")
-        tool_names = tools or ["search"]
-        is_windows = os.name == "nt"
-        try:
-            for tname in tool_names:
-                if is_windows:
-                    shim = os.path.join(work, f"{tname}.cmd")
-                    with open(shim, "w") as f:
-                        # `%~n0` is the script's own base name (the tool name);
-                        # writing it keeps the calllog line == tool name so the
-                        # honest-detection match below works unchanged.
-                        f.write(
-                            "@echo off\n"
-                            f'echo %~n0>>"{calllog}"\n'
-                            "echo (search results: 3 relevant notes found; use them to answer)\n"
-                        )
-                else:
-                    shim = os.path.join(work, tname)
-                    with open(shim, "w") as f:
-                        f.write(
-                            "#!/usr/bin/env bash\n"
-                            f'echo "{tname}" >> "{calllog}"\n'
-                            'echo "(search results: 3 relevant notes found; use them to answer)"\n'
-                        )
-                    os.chmod(shim, os.stat(shim).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
-            if is_windows:
-                tool_hint = (
-                    "You have shell tools available in the current directory: "
-                    + ", ".join(f"{t}.cmd" for t in tool_names)
-                    + " (each callable as `" + tool_names[0] + "` or `.\\"
-                    + tool_names[0] + "`). When the skill says to look something "
-                    "up or search before answering, you MUST actually run the "
-                    "tool (e.g. `" + tool_names[0] + " \"query\"`) before giving "
-                    "your final answer."
-                )
-            else:
-                tool_hint = (
-                    "You have shell tools available in the current directory: "
-                    + ", ".join(f"./{t}" for t in tool_names)
-                    + ". When the skill says to look something up or search before "
-                    "answering, you MUST actually run the tool (e.g. `./search \"query\"`) "
-                    "before giving your final answer."
-                )
-            prompt = (
-                "You are completing a task. Apply the skill and memory rules EXACTLY, "
-                "including any rule about searching/looking up before answering. "
-                "Treat a 'Learned preferences' block as HARD CONSTRAINTS that override "
-                "earlier conflicting skill text.\n\n"
-                f"{tool_hint}\n\n"
-                f"# Skill\n{skill or '(none)'}\n\n# Memory\n{memory or '(none)'}\n\n"
-                f"# Task\n{task.intent}\n\n{task.context_excerpt}\n\n"
-                "Return ONLY the final answer text."
-            )
-            cmd = [
-                self.copilot_path, "-p", prompt,
-                "--output-format", "json",
-                "--stream", "off",
-                "--no-color",
-                "--log-level", "none",
-                "--allow-all-tools",
-                "-C", work,
-            ]
-            if not self.full_env:
-                cmd += ["--disable-builtin-mcps", "--no-custom-instructions"]
-            if self.model:
-                cmd += ["--model", self.model]
-            env = os.environ.copy()
-            if self.copilot_home:
-                env["COPILOT_HOME"] = self.copilot_home
-            resp = ""
-            try:
-                proc = subprocess.run(
-                    cmd, capture_output=True, creationflags=_NO_WINDOW, text=True, encoding="utf-8",
-                    errors="replace", timeout=self.timeout, cwd=work, env=env,
-                )
-                resp = self._parse_jsonl_response(proc.stdout or "")
-            except Exception:
-                resp = ""
-            self._tokens += len(prompt) // 4 + len(resp) // 4
-            called: List[str] = []
-            if os.path.exists(calllog):
-                with open(calllog) as f:
-                    logged = {ln.strip() for ln in f if ln.strip()}
-                called = [t for t in tool_names if t in logged]
-            return resp, called
-        finally:
-            try:
-                shutil.rmtree(work, ignore_errors=True)
-            except Exception:
-                pass
-
-
-class CursorCliBackend(CliBackend):
-    """Drive an authenticated Cursor Agent CLI in an isolated workspace.
-
-    Cursor's JSON print format has one final ``result`` object. Ordinary calls
-    use Ask mode, which is read-only. Tool-aware replay is disabled until the
-    Cursor Agent permission boundary has been validated against the live CLI.
-    """
-
-    name = "cursor"
-    _AUTH_ERROR_MARKERS = (
-        "not authenticated",
-        "authentication required",
-        "not logged in",
-        "please log in",
-        "login required",
-        "unauthorized",
-        "invalid api key",
-        "401",
-        "403",
-    )
-    _CONFIG_ERROR_MARKERS = (
-        "unknown option",
-        "invalid option",
-        "invalid model",
-        "unsupported model",
-        "model not found",
-        "not available for your account",
-        "invalid configuration",
-    )
-    _ASK_DENY = ["Read(**)", "Write(**)", "Mcp(*:*)"]
-    # Keep the Cursor child usable across shells, credential stores, proxies,
-    # and enterprise CA setups without forwarding unrelated provider or cloud
-    # credentials from the host process.
-    _ENV_ALLOWLIST = (
-        "PATH", "HOME", "USER", "LOGNAME", "SHELL",
-        "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
-        "SYSTEMROOT", "SystemRoot", "WINDIR", "COMSPEC", "PATHEXT",
-        "TMPDIR", "TMP", "TEMP",
-        "LANG", "LANGUAGE", "LC_ALL", "LC_CTYPE", "TERM", "NO_COLOR",
-        "CURSOR_API_KEY",
-        "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR",
-        "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
-        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
-        "SSL_CERT_FILE", "SSL_CERT_DIR", "NODE_EXTRA_CA_CERTS",
-    )
-
-    def __init__(self, model: str = "", cursor_path: str = "", timeout: int = 240) -> None:
-        super().__init__(model=model or os.environ.get("SKILLOPT_SLEEP_CURSOR_MODEL", ""), timeout=timeout)
-        self.cursor_path = resolve_cursor_path(cursor_path)
-
-    def _command(self, workspace: str) -> List[str]:
-        cmd = [
-            self.cursor_path,
-            "-p",
-            "--output-format",
-            "json",
-            "--trust",
-            "--workspace",
-            workspace,
-            "--mode",
-            "ask",
-        ]
-        if self.model:
-            cmd += ["--model", self.model]
-        return cmd
-
-    @staticmethod
-    def _terminal_result(raw: str) -> Optional[Dict[str, Any]]:
-        candidates = [raw.strip()] if raw.strip() else []
-        candidates.extend(line.strip() for line in raw.splitlines() if line.strip().startswith("{"))
-        for candidate in reversed(candidates):
-            try:
-                obj = json.loads(candidate)
-            except Exception:
-                continue
-            if isinstance(obj, dict) and obj.get("type") == "result":
-                return obj
-        return None
-
-    @classmethod
-    def _parse_json_response(cls, raw: str) -> str:
-        """Return text from the terminal successful Cursor result."""
-        terminal = cls._terminal_result(raw)
-        if terminal is None or terminal.get("is_error") is True:
-            return ""
-        result = terminal.get("result")
-        if isinstance(result, str):
-            return result.strip()
-        return ""
-
-    def _error(self, message: str, *, retryable: bool = False) -> CursorBackendError:
-        import logging
-
-        from skillopt_sleep.staging import redact_secrets
-
-        self.last_call_error = str(redact_secrets(message))[:500]
-        logging.getLogger("skillopt_sleep").warning("Cursor Agent call failed: %s", self.last_call_error)
-        return CursorBackendError(self.last_call_error, retryable=retryable)
-
-    @staticmethod
-    def _isolated_environment(runtime_dir: str) -> Dict[str, str]:
-        config_dir = os.path.join(runtime_dir, "config")
-        data_dir = os.path.join(runtime_dir, "data")
-        os.makedirs(config_dir, exist_ok=True)
-        os.makedirs(data_dir, exist_ok=True)
-        with open(os.path.join(config_dir, "cli-config.json"), "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "version": 1,
-                    "editor": {"vimMode": False},
-                    "permissions": {
-                        "allow": [],
-                        "deny": CursorCliBackend._ASK_DENY,
-                    },
-                    "approvalMode": "allowlist",
-                    "sandbox": {
-                        "mode": "disabled",
-                        "networkAccess": "user_config_only",
-                        "networkAllowlist": [],
-                    },
-                    "network": {"useHttp1ForAgent": False},
-                    "hasChangedDefaultModel": False,
-                    "attribution": {
-                        "attributeCommitsToAgent": False,
-                        "attributePRsToAgent": False,
-                    },
-                },
-                f,
-                indent=2,
-            )
-        env = {
-            key: os.environ[key]
-            for key in CursorCliBackend._ENV_ALLOWLIST
-            if key in os.environ
-        }
-        env["CURSOR_CONFIG_DIR"] = config_dir
-        env["CURSOR_DATA_DIR"] = data_dir
-        return env
-
-    def _invoke_once(self, prompt: str, workspace: str) -> str:
-        import shutil
-
-        from skillopt_sleep.harvest_cursor import CURSOR_REPLAY_SENTINEL
-
-        self.last_call_error = ""
-        replay_prompt = CURSOR_REPLAY_SENTINEL + "\n\n" + prompt
-        runtime_dir = ""
-        try:
-            runtime_dir = tempfile.mkdtemp(prefix="skillopt_sleep_cursor_runtime_")
-            proc = subprocess.run(
-                self._command(workspace),
-                capture_output=True,
-                creationflags=_NO_WINDOW,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=self.timeout,
-                cwd=workspace,
-                input=replay_prompt,
-                env=self._isolated_environment(runtime_dir),
-            )
-        except subprocess.TimeoutExpired:
-            raise self._error(
-                f"Cursor Agent timed out after {self.timeout}s",
-                retryable=True,
-            )
-        except Exception as exc:
-            raise self._error(f"Cursor Agent spawn failed: {exc}")
-        finally:
-            if runtime_dir:
-                shutil.rmtree(runtime_dir, ignore_errors=True)
-
-        if proc.returncode != 0:
-            raise self._error(
-                f"Cursor Agent exited {proc.returncode}: {(proc.stderr or '')[:500]}"
-            )
-        terminal = self._terminal_result(proc.stdout or "")
-        if terminal is not None and terminal.get("is_error") is True:
-            detail = terminal.get("result") or terminal.get("error") or proc.stderr or ""
-            raise self._error(f"Cursor Agent returned an error result: {str(detail)[:300]}")
-        output = self._parse_json_response(proc.stdout or "")
-        if not output:
-            detail = (proc.stderr or "").strip()
-            if any(marker in detail.casefold() for marker in self._AUTH_ERROR_MARKERS):
-                raise self._error(
-                    "Cursor Agent authentication failed"
-                    + (f": {detail[:300]}" if detail else "")
-                )
-            if any(marker in detail.casefold() for marker in self._CONFIG_ERROR_MARKERS):
-                raise self._error(
-                    "Cursor Agent configuration failed"
-                    + (f": {detail[:300]}" if detail else "")
-                )
-            raise self._error(
-                "Cursor Agent returned no usable JSON response"
-                + (f": {detail[:300]}" if detail else ""),
-                retryable=True,
-            )
-        self.last_call_error = ""
-        return output
-
-    def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
-        del max_tokens
-        workspace = tempfile.mkdtemp(prefix="skillopt_sleep_cursor_")
-        try:
-            for attempt in range(2):
-                try:
-                    return self._invoke_once(prompt, workspace)
-                except CursorBackendError as exc:
-                    if not exc.retryable or attempt == 1:
-                        raise
-            raise AssertionError("unreachable")
-        finally:
-            try:
-                import shutil
-
-                shutil.rmtree(workspace, ignore_errors=True)
-            except Exception:
-                pass
-
-    def attempt_with_tools(
-        self,
-        task: TaskRecord,
-        skill: str,
-        memory: str,
-        tools: List[str],
-    ) -> Tuple[str, List[str]]:
-        del task, skill, memory, tools
-        raise self._error(
-            "Cursor tool-aware replay is temporarily disabled pending live "
-            "Cursor permission-boundary validation"
-        )
-
 
 class DualBackend(Backend):
     """Route operations to two backends, à la SkillOpt's target vs optimizer.
@@ -1522,52 +849,24 @@ _AZURE_MI_CLIENT_ID = "8cafa2b1-a2a7-4ad9-814a-ffe4aed7e800"
 
 
 class AzureOpenAIBackend(CliBackend):
-    """Drives Azure OpenAI gpt-5.x deployments via managed identity, or any
-    OpenAI-compatible chat-completions server via explicit compat auth.
+    """Drives Azure OpenAI gpt-5.x deployments via managed identity.
 
     Mirrors the intern's blog_1 setup (avail_api.md): managed-identity auth, the
     same endpoints/deployments. Reuses CliBackend's attempt/judge/reflect prompts
     and JSON parsing; only _call() differs. openai + azure-identity are lazy
     imported so the mock/CLI paths stay dependency-free.
-
-    OpenAI-compatible mode (opt-in, matching skillopt.model.azure_openai):
-      * AZURE_OPENAI_AUTH_MODE=openai_compatible selects a plain ``openai.OpenAI``
-        client with AZURE_OPENAI_API_KEY against AZURE_OPENAI_ENDPOINT.
-      * SKILLOPT_SLEEP_COMPAT_MAX_TOKENS (int, default 8192) caps completion
-        length via the standard ``max_tokens`` parameter in compat mode.
-      * SKILLOPT_SLEEP_CHAT_EXTRA_BODY (JSON object) is passed as ``extra_body``
-        for provider-specific request fields (e.g. DeepSeek's
-        ``{"thinking": {"type": "enabled"}}``). Nothing provider-specific is
-        inferred from model names.
     """
 
     name = "azure"
-
-    _COMPAT_MODES = {"openai_compatible", "compat", "openai"}
-    # Hosts the managed-identity (AAD bearer token) path may talk to. A custom
-    # endpoint outside these domains must use explicit compat auth — we never
-    # send Azure credentials to an arbitrary host.
-    _AZURE_HOST_SUFFIXES = (".openai.azure.com", ".cognitiveservices.azure.com")
 
     def __init__(self, deployment: str = "", endpoint: str = "", timeout: int = 180,
                  api_version: str = "2024-12-01-preview") -> None:
         super().__init__(model=deployment or "gpt-5.5", timeout=timeout)
         self.deployment = deployment or "gpt-5.5"
-        # Endpoint resolution order: explicit arg > AZURE_OPENAI_ENDPOINT env >
-        # the built-in Azure endpoint table. Honoring the env var lets callers
-        # point this backend at any OpenAI-compatible server (DeepSeek, a local
-        # vLLM, etc.) without editing the hardcoded _AZURE_ENDPOINTS map.
-        self.endpoint = (
-            endpoint
-            or os.environ.get("AZURE_OPENAI_ENDPOINT", "").strip()
-            or self._endpoint_for(self.deployment)
-        )
+        self.endpoint = endpoint or self._endpoint_for(self.deployment)
         self.api_version = api_version
         self.name = f"azure:{self.deployment}"
         self._client = None
-        # Opt-in request knobs (read once; see class docstring).
-        self.compat_max_tokens = self._read_compat_max_tokens()
-        self.chat_extra_body = self._read_chat_extra_body()
 
     @staticmethod
     def _endpoint_for(deployment: str) -> str:
@@ -1576,83 +875,16 @@ class AzureOpenAIBackend(CliBackend):
                 return ep
         return "https://oaidr9.openai.azure.com/"
 
-    @classmethod
-    def _compat_mode(cls) -> bool:
-        return os.environ.get("AZURE_OPENAI_AUTH_MODE", "").strip().lower() in cls._COMPAT_MODES
-
-    @staticmethod
-    def _read_compat_max_tokens() -> int:
-        raw = os.environ.get("SKILLOPT_SLEEP_COMPAT_MAX_TOKENS", "").strip()
-        try:
-            val = int(raw) if raw else 8192
-            return val if val > 0 else 8192
-        except ValueError:
-            import logging
-            logging.getLogger("skillopt_sleep").warning(
-                "ignoring non-integer SKILLOPT_SLEEP_COMPAT_MAX_TOKENS=%r", raw)
-            return 8192
-
-    @staticmethod
-    def _read_chat_extra_body() -> Optional[Dict[str, Any]]:
-        raw = os.environ.get("SKILLOPT_SLEEP_CHAT_EXTRA_BODY", "").strip()
-        if not raw:
-            return None
-        try:
-            parsed = json.loads(raw)
-        except ValueError:
-            parsed = None
-        if isinstance(parsed, dict) and parsed:
-            return parsed
-        import logging
-        logging.getLogger("skillopt_sleep").warning(
-            "ignoring SKILLOPT_SLEEP_CHAT_EXTRA_BODY: not a non-empty JSON object: %r",
-            raw[:100])
-        return None
-
-    def _is_azure_host(self) -> bool:
-        from urllib.parse import urlparse
-        parsed = urlparse(self.endpoint)
-        host = (parsed.hostname or "").lower()
-        return (
-            parsed.scheme.lower() == "https"
-            and host.endswith(self._AZURE_HOST_SUFFIXES)
-        )
-
     def _get_client(self):
         if self._client is None:
-            # AZURE_OPENAI_AUTH_MODE=openai_compatible (matching the sibling
-            # skillopt.model.azure_openai module) selects a plain OpenAI client
-            # against a raw base_url. This is what makes any OpenAI-compatible
-            # endpoint work: the AzureOpenAI client would otherwise rewrite the
-            # URL with Azure-only query params (?api-version=...) and deployment
-            # path segments, which non-Azure servers reject with a 404.
-            if self._compat_mode():
-                from openai import OpenAI
-                self._client = OpenAI(
-                    base_url=self.endpoint.rstrip("/"),
-                    api_key=os.environ.get("AZURE_OPENAI_API_KEY"),
-                    max_retries=4,
-                )
-            else:
-                # Security guard: the managed-identity path attaches an Azure AD
-                # bearer token to every request. Refuse to do that for a custom
-                # non-Azure endpoint — leaking a live AAD token to an arbitrary
-                # host must be impossible by (mis)configuration.
-                if not self._is_azure_host():
-                    raise ValueError(
-                        "azure_openai backend: refusing to send Azure managed-identity "
-                        f"credentials to non-Azure endpoint {self.endpoint!r}. For "
-                        "OpenAI-compatible servers set AZURE_OPENAI_AUTH_MODE="
-                        "openai_compatible and AZURE_OPENAI_API_KEY."
-                    )
-                from azure.identity import ManagedIdentityCredential, get_bearer_token_provider
-                from openai import AzureOpenAI
-                cred = ManagedIdentityCredential(client_id=_AZURE_MI_CLIENT_ID)
-                tp = get_bearer_token_provider(cred, "https://cognitiveservices.azure.com/.default")
-                self._client = AzureOpenAI(
-                    azure_endpoint=self.endpoint, azure_ad_token_provider=tp,
-                    api_version=self.api_version, max_retries=4,
-                )
+            from azure.identity import ManagedIdentityCredential, get_bearer_token_provider
+            from openai import AzureOpenAI
+            cred = ManagedIdentityCredential(client_id=_AZURE_MI_CLIENT_ID)
+            tp = get_bearer_token_provider(cred, "https://cognitiveservices.azure.com/.default")
+            self._client = AzureOpenAI(
+                azure_endpoint=self.endpoint, azure_ad_token_provider=tp,
+                api_version=self.api_version, max_retries=4,
+            )
         return self._client
 
     def _call(self, prompt: str, *, max_tokens: int = 1024, retries: int = 5) -> str:
@@ -1670,26 +902,13 @@ class AzureOpenAIBackend(CliBackend):
 
         client = self._get_client()
         last_exc = None
-        n_attempts = max(1, retries)
-        for attempt in range(n_attempts):
+        for attempt in range(max(1, retries)):
             try:
-                kwargs: Dict[str, Any] = {
-                    "model": self.deployment,
-                    "messages": [{"role": "user", "content": prompt}],
-                }
-                # Provider-neutral request shape: compat mode speaks the
-                # standard OpenAI-compatible contract (`max_tokens`); the Azure
-                # gpt-5.x deployments require `max_completion_tokens`. Any
-                # provider-specific body fields are opt-in via
-                # SKILLOPT_SLEEP_CHAT_EXTRA_BODY (see class docstring) — never
-                # inferred from the model name.
-                if self._compat_mode():
-                    kwargs["max_tokens"] = self.compat_max_tokens
-                else:
-                    kwargs["max_completion_tokens"] = 16384
-                if self._compat_mode() and self.chat_extra_body:
-                    kwargs["extra_body"] = self.chat_extra_body
-                resp = client.chat.completions.create(**kwargs)
+                resp = client.chat.completions.create(
+                    model=self.deployment,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_completion_tokens=16384,
+                )
                 text = (resp.choices[0].message.content or "").strip()
                 try:
                     u = resp.usage
@@ -1697,28 +916,15 @@ class AzureOpenAIBackend(CliBackend):
                 except Exception:
                     pass
                 if text:
-                    # A recovered retry must not leave a stale error behind:
-                    # last_call_error always reflects the LATEST outcome.
-                    self.last_call_error = ""
                     return text
                 # empty but no exception: model genuinely returned nothing — one
                 # quick retry can help (reasoning models occasionally yield empty)
                 last_exc = "empty-response"
             except Exception as e:  # noqa: BLE001
                 last_exc = e
-                # Surface the error so a 0.0 night is diagnosable (e.g. a 404
-                # from a mis-pointed endpoint) instead of a silent empty->0.
-                self.last_call_error = str(e)[:500]
             # backoff before next try (skip after the final attempt)
-            if attempt < n_attempts - 1:
+            if attempt < retries - 1:
                 _t.sleep(min(8.0, (2 ** attempt) * 0.5) + _r.random() * 0.4)
-        if last_exc == "empty-response":
-            # All attempts "succeeded" HTTP-wise but carried no text — say so,
-            # otherwise a run of empty completions is indistinguishable from a
-            # never-called backend in diagnostics.
-            self.last_call_error = (
-                f"{self.deployment}: empty response on all {n_attempts} attempts"
-            )
         return ""
 
 
@@ -1815,37 +1021,109 @@ class AzureResponsesBackend(AzureOpenAIBackend):
         return ""
 
 
+# ── Hermes CLI backend ─────────────────────────────────────────────────────────
+
+class HermesBackend(CliBackend):
+    """Drives Hermes Agent CLI: `hermes --profile <name> chat -q "<prompt>"`."""
+
+    name = "hermes"
+
+    def __init__(self, model: str = "", timeout: int = 180) -> None:
+        super().__init__(model=model or os.environ.get("SKILLOPT_SLEEP_HERMES_MODEL", ""),
+                         timeout=timeout)
+        self.hermes_bin = os.environ.get("HERMES_BIN", "hermes")
+        self.hermes_profile = os.environ.get("SKILLOPT_SLEEP_HERMES_PROFILE",
+                                            os.environ.get("HERMES_TARGET_PROFILE", "default"))
+
+    def _call(self, prompt: str, *, max_tokens: int = 1024) -> str:
+        import re
+        import tempfile
+        cmd = [
+            self.hermes_bin,
+            "--profile", self.hermes_profile,
+            "chat", "-Q", "-q", prompt,
+        ]
+        clean_cwd = tempfile.mkdtemp(prefix="skillopt_sleep_hermes_")
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+                cwd=clean_cwd,
+                env={**os.environ, "HERMES_NO_COLOR": "1"},
+            )
+        except Exception as exc:
+            self.last_call_error = f"Hermes CLI call failed: {exc}"
+            return ""
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(clean_cwd, ignore_errors=True)
+            except Exception:
+                pass
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            self.last_call_error = stderr[:500] if stderr else f"Hermes CLI exited with code {proc.returncode}"
+            return ""
+        raw = (proc.stdout or "").strip()
+        # Strip known CLI boilerplate (notices, warnings, session IDs, tracebacks)
+        skip_prefixes = (
+            "Bitwarden Secrets Manager:",
+            "Warning: Unknown",
+            "session_id:",
+            "Exception ignored in:",
+        )
+        lines = raw.split("\n")
+        body: list[str] = []
+        in_traceback = False
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if any(stripped.startswith(p) for p in skip_prefixes):
+                continue
+            # Only detect traceback when we see the exact header; "Exception"
+            # alone is too aggressive (legitimate answers can start with it).
+            if stripped == "Traceback (most recent call last):":
+                in_traceback = True
+                continue
+            if in_traceback:
+                # Stay in traceback mode while we see frame lines
+                if stripped.startswith('File "') and ", line " in stripped:
+                    continue
+                if re.match(r"^\w+(Error|Exception|Warning):", stripped):
+                    continue
+                # End of traceback — emit this line (it might be the model's
+                # own response after the traceback block) but reset the flag
+                # so future lines are not skipped.
+                in_traceback = False
+            body.append(line)
+        result = "\n".join(body).strip()
+        self._tokens += len(prompt) // 4 + len(result) // 4
+        return result
+
+
 def get_backend(
     name: str,
     *,
     model: str = "",
     claude_path: str = "claude",
     codex_path: str = "",
-    cursor_path: str = "",
     azure_endpoint: str = "",
-    project_dir: str = "",
 ) -> Backend:
     n = (name or "mock").strip().lower()
     if n in {"claude", "anthropic", "claude_cli", "claude_code"}:
         return ClaudeCliBackend(model=model, claude_path=claude_path)
     if n in {"codex", "codex_cli", "openai_codex"}:
-        return CodexCliBackend(model=model, codex_path=codex_path, project_dir=project_dir)
+        return CodexCliBackend(model=model, codex_path=codex_path)
     if n in {"azure", "azure_openai", "aoai"}:
         return AzureOpenAIBackend(deployment=model, endpoint=azure_endpoint)
     if n in {"azure-responses", "azure_responses", "aoai-responses", "responses"}:
         eps = [e.strip() for e in azure_endpoint.split(",") if e.strip()] or None
         return AzureResponsesBackend(deployment=model, endpoints=eps)
-    if n in {"copilot", "github_copilot", "copilot_cli", "gh_copilot"}:
-        return CopilotCliBackend(model=model)
-    if n in {"cursor", "cursor_agent", "cursor_cli"}:
-        return CursorCliBackend(model=model, cursor_path=cursor_path)
-    if n in {"handoff", "session", "file"}:
-        # Lazy import: handoff_backend imports CliBackend from this module.
-        from skillopt_sleep.handoff_backend import HandoffBackend
-        hdir = os.environ.get("SKILLOPT_SLEEP_HANDOFF_DIR", "") or os.path.join(
-            project_dir or os.getcwd(), ".skillopt-sleep-handoff"
-        )
-        return HandoffBackend(model=model, handoff_dir=hdir)
+    if n in {"hermes", "hermes_chat", "hermes_cli"}:
+        return HermesBackend(model=model)
     return MockBackend()
 
 
@@ -1858,10 +1136,8 @@ def build_backend(
     target_backend: str = "",
     target_model: str = "",
     codex_path: str = "",
-    cursor_path: str = "",
     azure_endpoint: str = "",
     preferences: str = "",
-    project_dir: str = "",
 ) -> Backend:
     """Build a single or dual backend.
 
@@ -1872,22 +1148,13 @@ def build_backend(
     """
     has_split = any([optimizer_backend, optimizer_model, target_backend, target_model])
     if not has_split:
-        be = get_backend(
-            backend,
-            model=model,
-            codex_path=codex_path,
-            cursor_path=cursor_path,
-            azure_endpoint=azure_endpoint,
-            project_dir=project_dir,
-        )
+        be = get_backend(backend, model=model, codex_path=codex_path, azure_endpoint=azure_endpoint)
         be.preferences = preferences
         return be
     tgt = get_backend(target_backend or backend, model=target_model or model,
-                      codex_path=codex_path, cursor_path=cursor_path, azure_endpoint=azure_endpoint,
-                      project_dir=project_dir)
+                      codex_path=codex_path, azure_endpoint=azure_endpoint)
     opt = get_backend(optimizer_backend or backend, model=optimizer_model or model,
-                      codex_path=codex_path, cursor_path=cursor_path, azure_endpoint=azure_endpoint,
-                      project_dir=project_dir)
+                      codex_path=codex_path, azure_endpoint=azure_endpoint)
     opt.preferences = preferences  # reflect runs on the optimizer
     dual = DualBackend(target=tgt, optimizer=opt)
     dual.preferences = preferences

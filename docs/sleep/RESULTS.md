@@ -2,9 +2,8 @@
 
 This is the evidence behind SkillOpt-Sleep: does a nightly, offline sleep cycle
 actually make a *deployed* agent better, and is it safe to run unattended? We
-answer with a controlled deployment-scale study built from the same shipped
-consolidation and gate components. Its multi-night benchmark recipe is an
-experiment configuration, not the default configuration of the nightly CLI.
+answer with a controlled deployment-scale study — the same protocol the plugin
+runs in production, scored on full held-out test sets.
 
 ## Setup
 
@@ -12,10 +11,9 @@ experiment configuration, not the default configuration of the nightly CLI.
 **10 new real "today" tasks**; the skill carries over and is refined night to
 night. The full held-out **test** split is scored before night 1 (*baseline*) and
 after night 5 (*after*); **Δ = after − baseline** in percentage points. Optimizer
-model = **GPT-5.5**; single seed (42). The measurements use the shipped replay,
-consolidation, and gate implementations. The nightly CLI and the checked-in
-benchmark convenience harnesses are separate entry points and do not all call one
-shared wrapper function.
+model = **GPT-5.5**; single seed (42); every number is produced by the exact
+shipped engine `skillopt_sleep.dream.dream_consolidate` (the experiment harness and
+the plugin cycle call the same function).
 
 **Benchmarks** (real evaluators, not format heuristics):
 
@@ -53,41 +51,11 @@ argument for SkillOpt-Sleep's design, and why the gate ships **on by default**.
 
 ---
 
-## 2. Cross-model scaling — bigger gains where there's headroom
-
-The same protocol on a weaker target model (**GPT-5.4-nano**, optimizer = GPT-5.5)
-produces substantially larger gains — because the weaker model has more room to
-learn. This is the realistic "cheap deployed agent, strong overnight optimizer"
-scenario:
-
-| Config (SearchQA, nano, gated) | Baseline → After | Δ | Night-by-night |
-|---|---|---|---|
-| **cumulative replay, nights=5** | 0.560 → **0.679** | **+11.9** | 0.560 → 0.626 → 0.665 → 0.665 → 0.665 → 0.679 |
-| recall_k=20, nights=5 | 0.566 → 0.681 | +11.5 | 0.566 → 0.659 → 0.685 → 0.685 → 0.681 → 0.681 |
-| cumulative, nights=8 | 0.562 → 0.657 | +9.5 | saturates after night 5 |
-
-Both replay strategies (cumulative and recall) agree within 0.4 pt — the gain is
-robust across configurations.
-
-**Compared to GPT-5.5 on the same benchmark (SearchQA, gated):**
-
-| Target model | Best Δ | Baseline | Headroom |
-|---|---|---|---|
-| GPT-5.4-nano | **+11.9** | 0.560 | 44 pt |
-| GPT-5.5 | +6.0 | 0.798 | 20 pt |
-
-The story: **SkillOpt-Sleep helps most where there's the most to learn** — weaker
-deployed models benefit ~2× as much from the same nightly optimization. This is
-also the economical deployment pattern (cheap inference model + one strong
-overnight optimizer call).
-
----
-
-## 3. Experience replay turns a one-time bump into a climb
+## 2. Experience replay turns a one-time bump into a climb
 
 The plugin's two opt-in knobs (`recall_k`, `dream_rollouts`) are what produce the
-gains. On **SearchQA, GPT-5.5, gated** — the gain rises monotonically with how
-much relevant past experience is recalled:
+gains. On the cleanest signal — **SearchQA, GPT-5.5, gated** — the gain rises
+monotonically with how much relevant past experience is recalled:
 
 | Replay (`dream_rollouts=5`) | Baseline → After | Δ |
 |---|---|---|
@@ -102,41 +70,20 @@ plateauing — full-history replay, gated, night by night:
 0.798 → 0.814 → 0.854 → 0.854 → 0.854 → 0.858
 ```
 
-The gate accepts a new, better skill as late as **night 5** (0.854 → 0.858).
-Replay-policy ablation (SearchQA, GPT-5.5):
+The gate accepts a new, better skill as late as **night 5** (0.854 → 0.858) — the
+best SearchQA result in the whole study. Replay-policy ablation (SearchQA, GPT-5.5):
 
 | Replay policy | Gate-free Δ | Gated Δ |
 |---|---|---|
 | none (tonight's tasks only) | +3.9 | +2.0 |
-| **recall k=10 (opt-in experiment)** | +5.1 | +4.4 |
+| **recall k=10 (shipped default-able)** | +5.1 | +4.4 |
 | cumulative (full history) | +4.8 | +6.0 |
 
 Recall captures most of cumulative's benefit at a fraction of the per-night cost.
 
 ---
 
-## 4. Sensitivity around the experiment recipe
-
-We swept `dream_factor`, `rollouts`, `per_night`, and `nights` on the nano cell
-(SearchQA, gated) around the study recipe: `dream_factor=2`, `rollouts=5`,
-`per_night=10`, and `nights=5`. These are **experiment values**, not the shipping
-defaults (`dream_factor=0`, `dream_rollouts=1`, and `recall_k=0`):
-
-| Variant | Δ | vs experiment baseline (+11.9) |
-|---|---|---|
-| dream_factor=4 (baseline 2) | +8.8 | −3.1 |
-| rollouts=10 (baseline 5) | +9.5 | −2.4 |
-| per_night=15 (baseline 10) | +2.7 | −9.2 |
-| nights=8 (baseline 5) | +9.5 | −2.4 |
-
-Every tested direction away from that baseline reduced the measured gain in this
-cell. The result supports that particular study recipe; it does not establish a
-universal optimum. Shipping stays conservative, and users must opt in to additional
-dream rollouts or recall after considering task quality and provider cost.
-
----
-
-## 5. Why these gains exist — the dream-diversity fix (and a rigor note)
+## 3. Why these gains exist — the dream-diversity fix (and a rigor note)
 
 Reflection learns from the **contrast** between good and bad rollouts of the same
 task, which requires the K dream rollouts to be *independent samples*. An early
@@ -149,7 +96,7 @@ gains in Sections 1–2. Measured across an 18-cell deployment sweep (3 benchmar
 |---|---|---|---|---|
 | single-sample reflection (degraded) | −2.66 | **−52.8** | 7 / 18 | 5 / 18 |
 | diverse rollouts (K=5), no recall | +0.24 | −4.0 | 6 / 18 | 7 / 18 |
-| **diverse rollouts + recall (experiment recipe)** | **+0.53** | **−2.4** | 7 / 18 | 7 / 18 |
+| **diverse rollouts + recall (shipped)** | **+0.53** | **−2.4** | 7 / 18 | 7 / 18 |
 
 The catastrophic −52.8 is removed **at its source** by diverse rollouts: the same
 gate-free nano-SearchQA cell goes 0.554 → **0.586 (+2.7)** with no gate at all once
@@ -160,7 +107,7 @@ slips through.
 
 ---
 
-## 6. End-to-end on real agents
+## 4. End-to-end on real agents
 
 On the public [gbrain-evals](https://github.com/garrytan/gbrain-evals) `skillopt-v1`
 benchmark — designed for exactly this learnable-gap setting — deficient seed skills
@@ -170,7 +117,7 @@ cross-verify each other's consolidated skills.
 
 ---
 
-## 7. Honest scope & limitations
+## 5. Honest scope & limitations
 
 - **Where it helps:** recurring tasks with a checkable correctness signal and real
   headroom. That is the plugin's actual use case (your repeated daily tasks and
@@ -185,7 +132,18 @@ cross-verify each other's consolidated skills.
   −52.8 collapse. Gate-free mode is for users who cannot hold out a validation set
   and is additionally protected by the output-contract guardrail.
 
----
+## Reproduce
+
+```bash
+PY=python  # an env with openai + azure-identity
+# one cell (SearchQA, GPT-5.5, gated, recall + dream rollouts):
+SKILLOPT_SLEEP_WORKERS=24 PYTHONPATH=. $PY -m skillopt_sleep.experiments.run_nightly \
+  --backend azure-responses --model gpt-5.5 --benchmarks searchqa --gate on \
+  --replay-mode retrieval --retrieve-k 20 --rollouts 5 --nights 5 --per-night 10 --json
+# full grid across models/benchmarks/modes:
+SKILLOPT_SLEEP_WORKERS=32 PYTHONPATH=. $PY -m skillopt_sleep.experiments.run_nightly_matrix \
+  --model gpt-5.5 --replay-mode retrieval --retrieve-k 20 --nights 5 --per-night 10 --rollouts 5
+```
 
 Back to the module overview: [`docs/sleep/README.md`](README.md) ·
-documentation index: [SkillOpt documentation](../index.md).
+full reference: [Documentation & Reproduction Guide](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).

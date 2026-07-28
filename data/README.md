@@ -29,7 +29,7 @@ Each `items.json` contains only stable IDs or source-path hints.
 | Manifest directory | Benchmark | Counts | Coverage | Raw data source | `split_dir` |
 |---|---|---:|---|---|---|
 | `searchqa_id_split/` | SearchQA | 400 / 200 / 1400 | Official HF dataset IDs | [lucadiliello/searchqa](https://huggingface.co/datasets/lucadiliello/searchqa) | `data/searchqa_split` |
-| `livemathematicianbench_id_split/` | LiveMathematicianBench | 35 / 17 / 125 | Four official monthly files | [LiveMathematicianBench/LiveMathematicianBench](https://huggingface.co/datasets/LiveMathematicianBench/LiveMathematicianBench) | `data/livemathematicianbench_split` |
+| `livemathematicianbench_id_split/` | LiveMathematicianBench | 35 / 18 / 124 | Four official monthly files | [LiveMathematicianBench/LiveMathematicianBench](https://huggingface.co/datasets/LiveMathematicianBench/LiveMathematicianBench) | `data/livemathematicianbench_split` |
 | `docvqa_id_split/` | DocVQA | 107 / 53 / 374 | 10% subset of validation | [lmms-lab/DocVQA](https://huggingface.co/datasets/lmms-lab/DocVQA) | `data/docvqa/splits` |
 | `officeqa_id_split/` | OfficeQA | 50 / 24 / 172 | OfficeQA Full | [databricks/officeqa](https://huggingface.co/datasets/databricks/officeqa) | `data/officeqa_split` |
 | `spreadsheetbench_id_split/` | SpreadsheetBench | 80 / 40 / 280 | SpreadsheetBench Verified 400 | [KAKA22/SpreadsheetBench](https://huggingface.co/datasets/KAKA22/SpreadsheetBench) | `data/spreadsheetbench_split` |
@@ -137,20 +137,6 @@ ALFWorld:
 
 `searchqa_id_split/` is an ID-only manifest. Each released `id` exactly matches
 the `key` field in `lucadiliello/searchqa`.
-
-To materialize the runnable SearchQA split used by
-`configs/searchqa/default.yaml`, install the optional dependency and run:
-
-```bash
-python -m pip install 'skillopt[searchqa]'
-python scripts/materialize_searchqa.py
-```
-
-This writes full examples to:
-
-```text
-data/searchqa_split
-```
 
 Materialized examples must include the fields consumed by the SearchQA
 environment, including:

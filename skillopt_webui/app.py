@@ -9,18 +9,14 @@ import glob
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
-from urllib.parse import urlparse
 
 import gradio as gr
 import yaml
-
-from skillopt.config import flatten_config
-from skillopt.config import load_config as load_merged_config
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -46,131 +42,6 @@ def config_to_display(cfg: dict) -> str:
     return yaml.dump(cfg, default_flow_style=False, sort_keys=False)
 
 
-def _can_connect_to_url(url: str, timeout: float = 0.5) -> bool:
-    parsed = urlparse(url)
-    host = parsed.hostname
-    if not host:
-        return False
-    port = parsed.port or (443 if parsed.scheme == "https" else 80)
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            return True
-    except OSError:
-        return False
-
-
-def _load_env_file(path: Path, env: dict[str, str]) -> None:
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line.startswith("export "):
-            line = line[len("export "):].strip()
-        if line and not line.startswith("#") and "=" in line:
-            key, value = line.split("=", 1)
-            env[key.strip()] = value.strip().strip("\"'")
-
-
-def build_training_env() -> dict[str, str]:
-    """Build the environment shared by preflight and the training subprocess."""
-    env = os.environ.copy()
-    env["PYTHONUNBUFFERED"] = "1"
-
-    dot_env = PROJECT_ROOT / ".env"
-    if dot_env.is_file():
-        _load_env_file(dot_env, env)
-
-    secrets_dir = PROJECT_ROOT / ".secrets"
-    if secrets_dir.is_dir():
-        for env_file in sorted(secrets_dir.glob("*.env")):
-            _load_env_file(env_file, env)
-
-    # Propagate OPTIMIZER_* to base AZURE_OPENAI_* when base is missing,
-    # so target/default endpoints inherit from optimizer config.
-    for suffix in (
-        "ENDPOINT", "API_VERSION", "AUTH_MODE", "MANAGED_IDENTITY_CLIENT_ID",
-        "AD_SCOPE", "API_KEY",
-    ):
-        base_key = f"AZURE_OPENAI_{suffix}"
-        optimizer_key = f"OPTIMIZER_AZURE_OPENAI_{suffix}"
-        if not env.get(base_key) and env.get(optimizer_key):
-            env[base_key] = env[optimizer_key]
-    return env
-
-
-def validate_training_config(
-    config_path: str,
-    overrides: dict,
-    env: dict[str, str] | None = None,
-) -> str | None:
-    """Return an actionable preflight error, or None when training can start."""
-    env = env or os.environ
-    cfg_options = [
-        f"{key}={value}" for key, value in overrides.items()
-        if value is not None and value != ""
-    ]
-    try:
-        cfg = flatten_config(load_merged_config(str(PROJECT_ROOT / config_path), cfg_options))
-    except Exception as exc:
-        return f"❌ Invalid config: {exc}"
-
-    shared_endpoint = (
-        cfg.get("azure_openai_endpoint")
-        or cfg.get("azure_endpoint")
-        or env.get("AZURE_OPENAI_ENDPOINT")
-    )
-    missing_openai_roles = []
-    for role in ("optimizer", "target"):
-        if cfg.get(f"{role}_backend") != "openai_chat":
-            continue
-        role_endpoint = (
-            cfg.get(f"{role}_azure_openai_endpoint")
-            or env.get(f"{role.upper()}_AZURE_OPENAI_ENDPOINT")
-            or shared_endpoint
-        )
-        if not role_endpoint:
-            missing_openai_roles.append(role)
-    if missing_openai_roles:
-        configured_backend = cfg.get("model_backend")
-        detail = ""
-        if configured_backend in {"qwen", "qwen_chat"}:
-            detail = (
-                "\nNote: model.backend is qwen, but explicit optimizer_backend/"
-                "target_backend values are still openai_chat."
-            )
-        return (
-            "❌ Model backend is not ready: missing Azure/OpenAI-compatible endpoint "
-            f"for {', '.join(missing_openai_roles)}.\n"
-            "Set model.azure_openai_endpoint (or AZURE_OPENAI_ENDPOINT), or change "
-            "the role backends to the backend you intend to use."
-            f"{detail}"
-        )
-
-    qwen_failures = []
-    qwen_shared = (
-        cfg.get("qwen_chat_base_url")
-        or env.get("QWEN_CHAT_BASE_URL")
-        or "http://localhost:8000/v1"
-    )
-    for role in ("optimizer", "target"):
-        if cfg.get(f"{role}_backend") != "qwen_chat":
-            continue
-        base_url = (
-            cfg.get(f"{role}_qwen_chat_base_url")
-            or env.get(f"{role.upper()}_QWEN_CHAT_BASE_URL")
-            or qwen_shared
-        )
-        if not _can_connect_to_url(str(base_url)):
-            qwen_failures.append(f"{role}={base_url}")
-    if qwen_failures:
-        return (
-            "❌ Model backend is not ready: cannot connect to qwen_chat endpoint "
-            f"for {', '.join(qwen_failures)}.\n"
-            "Start your OpenAI-compatible Qwen/vLLM server, or set "
-            "model.qwen_chat_base_url / OPTIMIZER_QWEN_CHAT_BASE_URL / "
-            "TARGET_QWEN_CHAT_BASE_URL to the correct URL."
-        )
-    return None
-
-
 # ─── Training process management ────────────────────────────────────────────
 
 class TrainingManager:
@@ -192,11 +63,6 @@ class TrainingManager:
             if self.running:
                 return "⚠️ Training already running. Stop it first."
 
-        env = build_training_env()
-        preflight_error = validate_training_config(config_path, overrides, env)
-        if preflight_error:
-            return preflight_error
-
         cmd = [
             sys.executable, "scripts/train.py",
             "--config", config_path,
@@ -208,6 +74,30 @@ class TrainingManager:
         if cfg_options:
             cmd.append("--cfg-options")
             cmd.extend(cfg_options)
+
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        # Auto-load API credentials from .secrets/*.env
+        secrets_dir = PROJECT_ROOT / ".secrets"
+        if secrets_dir.is_dir():
+            for env_file in sorted(secrets_dir.glob("*.env")):
+                for line in env_file.read_text().splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env[k] = v
+        # Propagate OPTIMIZER_* to base AZURE_OPENAI_* when base is missing,
+        # so target/default endpoints inherit from optimizer config.
+        _propagate = [
+            ("ENDPOINT", ""), ("API_VERSION", ""), ("AUTH_MODE", ""),
+            ("MANAGED_IDENTITY_CLIENT_ID", ""), ("AD_SCOPE", ""),
+            ("API_KEY", ""),
+        ]
+        for suffix, _ in _propagate:
+            base_key = f"AZURE_OPENAI_{suffix}"
+            optimizer_key = f"OPTIMIZER_AZURE_OPENAI_{suffix}"
+            if not env.get(base_key) and env.get(optimizer_key):
+                env[base_key] = env[optimizer_key]
 
         try:
             proc = subprocess.Popen(

@@ -17,8 +17,8 @@ from typing import Any, Dict, List
 class SessionDigest:
     """A normalized summary of one local agent session transcript.
 
-    Produced by source-specific harvesters from Claude Code transcripts, Codex
-    Desktop archived sessions, or Cursor Agent transcripts.
+    Produced by source-specific harvesters from Claude Code transcripts or
+    Codex Desktop archived sessions.
     """
 
     session_id: str
@@ -135,14 +135,8 @@ class SleepReport:
     candidate_score: float = 0.0
     accepted: bool = False
     gate_action: str = ""
-    no_edits_reason: str = ""
     edits: List[EditRecord] = field(default_factory=list)
     rejected_edits: List[EditRecord] = field(default_factory=list)
-    # Proposed edits that changed nothing (anchor absent, duplicate/empty add,
-    # unknown op). They were never scored by the gate, so they belong in neither
-    # list above — without them a night can report no edits while the optimizer
-    # actually produced several.
-    unmatched_edits: List[EditRecord] = field(default_factory=list)
     tokens_used: int = 0
     notes: List[str] = field(default_factory=list)
 

@@ -38,44 +38,22 @@ During training, the skill document is modified by **edit patches**:
 2. **Modifications**: Refining existing rules that are partially correct
 3. **Deletions**: Removing rules that consistently lead to errors
 
-Selected edits are applied together to produce a candidate skill. With the
-validation gate enabled, that candidate replaces the current skill only when
-its score on the selection split strictly improves.
-
-SkillOpt may maintain two protected, machine-managed regions:
-
-```markdown
-<!-- SLOW_UPDATE_START -->
-... epoch-level longitudinal guidance ...
-<!-- SLOW_UPDATE_END -->
-
-<!-- APPENDIX_START -->
-... skill-aware execution reminders ...
-<!-- APPENDIX_END -->
-```
-
-Normal edit patches cannot modify either region. Slow update owns the first;
-optional skill-aware reflection owns the second. Preserve these markers when
-copying or manually inspecting a trained skill.
+Each edit is validated through the **gate** mechanism before being permanently accepted.
 
 ## Initial Skill
 
 You can start training with:
 
-- **Empty skill**: Point `env.skill_init` to an empty Markdown file
+- **Empty skill**: The system learns everything from scratch
 - **Seed skill**: Provide initial instructions to bootstrap training
 - **Pre-trained skill**: Transfer a skill from a related benchmark
 
 Configure the initial skill in your YAML:
 
 ```yaml
-env:
-  skill_init: path/to/initial_skill.md
+train:
+  init_skill: "path/to/initial_skill.md"  # or omit for empty
 ```
-
-To start from scratch, create an empty Markdown file and use its path. A missing
-path currently also starts blank, so using an explicit file avoids silently
-treating a typo as an empty skill.
 
 ## Skill Quality Metrics
 
@@ -84,16 +62,15 @@ Track your skill's evolution through:
 - **Validation score**: Primary metric on the selection split
 - **Test score**: Final metric on held-out test data
 - **Skill length**: Total tokens in the document
-- **Candidate acceptance rate**: Fraction of candidate skill updates that pass
-  gating; multiple proposed edits can be combined into one candidate
+- **Edit acceptance rate**: Fraction of proposed edits that pass gating
 
 ## Best Practices
 
 !!! tip "Tips for better skills"
     1. **Start with a seed skill** (`env.skill_init`) if you have domain knowledge — it converges faster
     2. **Use cosine LR schedule** — aggressive early exploration + careful late refinement
-    3. **Enable slow update** (`optimizer.use_slow_update: true`) to counter forgetting across epochs
-    4. **Enable meta skill** (`optimizer.use_meta_skill: true`) so the optimizer accumulates strategy memory
+    3. **Enable slow update** (`use_slow_update: true`) to prevent forgetting across epochs
+    4. **Enable meta skill** (`use_meta_skill: true`) so the optimizer accumulates strategy memory
 
 ## Next Steps
 

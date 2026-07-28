@@ -24,10 +24,8 @@ _BACKEND_DEFAULT_MODELS = {
     "claude": "claude-sonnet-4-6",
     "claude_chat": "claude-sonnet-4-6",
     "claude_code_exec": "claude-sonnet-4-6",
-    "cursor_exec": "composer-2.5",
     "qwen_chat": "Qwen/Qwen3.5-4B",
     "minimax_chat": "MiniMax-M2.7",
-    "openai_compatible": "gpt-4o-mini",
 }
 
 _BACKEND_ALIASES = {
@@ -41,18 +39,11 @@ _BACKEND_ALIASES = {
     "claude": "claude_chat",
     "claude_chat": "claude_chat",
     "claude_code_exec": "claude_code_exec",
-    "cursor": "cursor_exec",
-    "cursor_agent": "cursor_exec",
-    "cursor_exec": "cursor_exec",
     "anthropic": "claude_chat",
     "qwen": "qwen_chat",
     "qwen_chat": "qwen_chat",
     "minimax": "minimax_chat",
     "minimax_chat": "minimax_chat",
-    "openai_compatible": "openai_compatible",
-    "openai_compatible_chat": "openai_compatible",
-    "openai-compatible": "openai_compatible",
-    "compat": "openai_compatible",
 }
 
 

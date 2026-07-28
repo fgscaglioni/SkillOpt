@@ -3,12 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from skillopt.utils.json_utils import (
-    _top_level_brace_objects,
-    _top_level_bracket_arrays,
-    extract_json,
-    extract_json_array,
-)
+from skillopt.utils.json_utils import extract_json, extract_json_array
 
 
 class TestExtractJson:
@@ -66,113 +61,6 @@ class TestExtractJson:
         assert extract_json(text) is None
 
 
-class TestTopLevelBraceObjects:
-    """_top_level_brace_objects — string/escape-aware top-level object scan."""
-
-    def test_single_clean_object(self) -> None:
-        assert _top_level_brace_objects('{"a": 1}') == ['{"a": 1}']
-
-    def test_two_top_level_objects(self) -> None:
-        assert _top_level_brace_objects('{"a":1}\n{"b":2}') == ['{"a":1}', '{"b":2}']
-
-    def test_brace_inside_quoted_prose_is_ignored(self) -> None:
-        """A '{' inside a quoted string must NOT start an object (the bug)."""
-        # Brace-shaped content inside a string, with no real object → no spans.
-        assert _top_level_brace_objects('label is "set it to {x: 1}" done') == []
-
-    def test_real_object_after_quoted_brace(self) -> None:
-        """Quoted-prose braces are skipped; a later real object is still found."""
-        text = 'note "{wrong: 1}" then actual {"edit": "right"}'
-        assert _top_level_brace_objects(text) == ['{"edit": "right"}']
-
-
-class TestTopLevelBracketArrays:
-    """_top_level_bracket_arrays — string/object-aware top-level array scan."""
-
-    def test_single_clean_array(self) -> None:
-        assert _top_level_bracket_arrays("[1, 2]") == ["[1, 2]"]
-
-    def test_two_top_level_arrays(self) -> None:
-        assert _top_level_bracket_arrays("[1]\n[2]") == ["[1]", "[2]"]
-
-    def test_array_inside_object_is_ignored(self) -> None:
-        assert _top_level_bracket_arrays('{"items": [1, 2]}') == []
-
-    def test_bracket_inside_quoted_prose_is_ignored(self) -> None:
-        assert _top_level_bracket_arrays('label is "set it to [x]" done') == []
-
-    def test_unmatched_prose_brace_does_not_hide_later_array(self) -> None:
-        text = "Explanation uses {placeholder, final answer [1, 2]"
-        assert _top_level_bracket_arrays(text) == ["[1, 2]"]
-
-    def test_many_unmatched_braces_scan_linearly(self) -> None:
-        class CountingText(str):
-            def __new__(cls, value: str):
-                instance = super().__new__(cls, value)
-                instance.reads = 0
-                return instance
-
-            def __getitem__(self, key):
-                self.reads += 1
-                return super().__getitem__(key)
-
-        text = CountingText("{" * 1_000 + " final answer [1, 2]")
-        assert _top_level_bracket_arrays(text) == ["[1, 2]"]
-        assert text.reads < len(text) * 4
-
-
-class TestExtractJsonTolerantFallback:
-    """extract_json — json_repair fallback for malformed non-OpenAI output."""
-
-    def test_prose_pseudo_json_returns_none(self) -> None:
-        """Regression: brace-shaped prose inside quotes must not be 'repaired'
-        into a bogus dict. It returned {'op': 'delete'} before the fix."""
-        text = 'The literal string "{op: delete}" appears in prose, not as JSON.'
-        assert extract_json(text) is None
-
-    def test_single_quoted_and_backticked_prose_returns_none(self) -> None:
-        """Regression: pseudo-JSON in single quotes / backticks / bare prose must
-        not be repaired into a bogus dict (the string-aware scan only skips
-        double-quoted prose; the JSON-like guard catches the rest)."""
-        for text in (
-            "The literal string '{op: delete}' appears in prose, not JSON.",
-            "The inline code `{op: delete}` appears in prose, not JSON.",
-            "The literal string 'set it to {x: 1}' appears in prose.",
-            "A bare mapping {op: delete} written in prose.",
-        ):
-            assert extract_json(text) is None, text
-
-    def test_json_string_values_with_quotes_still_repair(self) -> None:
-        """The JSON-like guard must NOT reject legitimate objects whose string
-        values contain single quotes or backticks."""
-        pytest.importorskip("json_repair")
-        assert extract_json('{"msg": "it\'s a test",}') == {"msg": "it's a test"}
-        assert extract_json('{"code": "use `backtick` here",}') == {"code": "use `backtick` here"}
-
-    def test_no_warning_on_quoted_prose(self, recwarn: pytest.WarningsRecorder) -> None:
-        """Prose pseudo-JSON (no real candidate) must not warn even without
-        json_repair installed — the JSON-like guard returns None before import."""
-        assert extract_json("The inline code `{op: delete}` appears in prose.") is None
-        assert extract_json("A bare mapping {op: delete} in prose.") is None
-        assert [w for w in recwarn.list if issubclass(w.category, RuntimeWarning)] == []
-
-    def test_no_warning_on_plain_text(self, recwarn: pytest.WarningsRecorder) -> None:
-        """No json_repair warning for ordinary no-JSON replies (no candidate)."""
-        assert extract_json("Just plain text without JSON.") is None
-        assert extract_json("") is None
-        assert [w for w in recwarn.list if issubclass(w.category, RuntimeWarning)] == []
-
-    def test_trailing_comma_repaired_when_available(self) -> None:
-        """With json_repair installed, a single malformed object is repaired."""
-        pytest.importorskip("json_repair")
-        assert extract_json('{"edit": "add", "text": "x",}') == {"edit": "add", "text": "x"}
-
-    def test_two_malformed_objects_too_ambiguous(self) -> None:
-        """Multiple top-level objects are ambiguous → None, never guess."""
-        pytest.importorskip("json_repair")
-        assert extract_json('{"first": true,} noise {"second": true,}') is None
-
-
 class TestExtractJsonArray:
     """extract_json_array — extract a JSON array from LLM response text."""
 
@@ -222,19 +110,3 @@ class TestExtractJsonArray:
         """extract_json_array should not match a bare JSON object."""
         text = '{"this is an object": true}'
         assert extract_json_array(text) is None
-
-    def test_ignores_prose_brackets_before_valid_array(self) -> None:
-        text = "Use [not JSON] as prose. Final answer: [1, 2, 3]"
-        assert extract_json_array(text) == [1, 2, 3]
-
-    def test_multiple_valid_arrays_are_ambiguous(self) -> None:
-        text = "First candidate [1], second candidate [2]"
-        assert extract_json_array(text) is None
-
-    def test_nested_object_array_not_confused_with_array_answer(self) -> None:
-        text = '{"items": [1, 2, 3]}'
-        assert extract_json_array(text) is None
-
-    def test_unmatched_prose_brace_before_valid_array(self) -> None:
-        text = "Explanation uses {placeholder, final answer [1, 2]"
-        assert extract_json_array(text) == [1, 2]

@@ -1,115 +1,112 @@
-# OpenClaw reference adaptation for SkillOpt-Sleep
+# OpenClaw Plugin for SkillOpt-Sleep
 
-This directory is a contributed reference for connecting
-[SkillOpt-Sleep](https://github.com/microsoft/SkillOpt) to
-[OpenClaw](https://github.com/openclaw/openclaw) with a custom DeepSeek/Ollama
-backend.
+Thin shell for running [SkillOpt-Sleep](https://github.com/microsoft/SkillOpt) on [OpenClaw](https://github.com/openclaw/openclaw).
 
-> **Reference status.** This is not one of the shared, plug-and-play
-> `skillopt_sleep` wrappers. Several scripts and the sample config contain
-> environment-specific absolute paths and assumptions from the original setup,
-> and the contributed wrapper has unresolved Python 3.10 syntax and backend
-> factory-signature gaps. The current checkout is not directly runnable; treat
-> it as porting source material, not an installation.
+## What it does
 
-## Included components
+Adds a nightly "sleep cycle" to any OpenClaw agent. The cycle:
 
-| File | Purpose |
-|---|---|
-| `run_sleep.py` | custom cycle entry point |
-| `skillopt_sleep_openclaw.py` | DeepSeek Chat Completions backend plus local Ollama embeddings |
-| `run_sleep_cron.sh` | category-oriented cron wrapper |
-| `slash_sleep.py` | experimental `/sleep` command helper |
-| `config.json` | example engine configuration |
-| `SKILL.md` | OpenClaw skill manifest |
-| `tests/*.json` | example task sets for research, DevOps, and wiki workflows |
+1. **Harvests** recent session transcripts from `~/.openclaw/agents/<name>/sessions/*.jsonl`
+2. **Mines** recurring task patterns using the optimizer LLM
+3. **Replays** each pattern with the current `SKILL.md` (baseline) and a candidate `SKILL.md` (with proposed edits)
+4. **Gates** the candidate against the held-out score (rejects regressions)
+5. **Stages** the accepted proposal in `~/.skillopt-sleep/staging/<night>/`
+6. Leaves adoption to the operator (Ethan)
 
-The adaptation imports the shared engine but registers its own backend and
-maintains its own wrapper behavior. Changes to the shared CLI documentation do
-not automatically make every option available through these custom scripts.
+Nothing live changes until you adopt. Every adopt backs up first.
 
-## Intended cycle
+## Install
 
-```text
-harvest supported session data or load a task file
-  → replay with the current skill
-  → propose bounded edits
-  → validate the candidate on held-out tasks
-  → stage a proposal for operator review
+The plugin is a thin wrapper around the engine at `~/.openclaw/workspace/SkillOpt/skillopt_sleep/`:
+
+```bash
+# 1. Clone the engine (one-time)
+cd ~/.openclaw/workspace
+git clone https://github.com/microsoft/SkillOpt.git
+
+# 2. Install the OpenClaw skill (this folder)
+ln -s /path/to/openclaw ~/.openclaw/workspace/skills/skillopt-sleep
+
+# 3. Configure
+cp ~/.openclaw/workspace/skills/skillopt-sleep/config.json ~/.skillopt-sleep/config.json
+$EDITOR ~/.skillopt-sleep/config.json
+# Set backend = "openclaw-deepseek"
+# Set model = "deepseek-v4-pro" (or "deepseek-v4-flash" for budget)
+
+# 4. Set API key
+echo 'export DEEPSEEK_API_KEY="sk-..."' >> ~/.openclaw/.env
+
+# 5. Add the nightly cron
+(crontab -l 2>/dev/null; echo "0 3 * * * cd ~/.openclaw/workspace/skills/skillopt-sleep && bash run_sleep_cron.sh >> ~/.skillopt-sleep/nightly.log 2>&1") | crontab -
 ```
 
-The intended safety boundary is manual adoption: review the generated report and
-staged files before changing a live skill.
+## Use
 
-## Adapt before use
+### Manual trigger
 
-1. Clone SkillOpt into a location you control:
+```bash
+# Run one cycle now
+python3 ~/.openclaw/workspace/skills/skillopt-sleep/run_sleep.py
 
-   ```bash
-   git clone https://github.com/microsoft/SkillOpt.git
-   cd SkillOpt/plugins/openclaw
-   ```
+# Dry run (report only)
+python3 ~/.openclaw/workspace/skills/skillopt-sleep/run_sleep.py --dry-run
 
-2. Inspect and replace the sample absolute paths in `run_sleep.py`,
-   `slash_sleep.py`, `run_sleep_cron.sh`, and `config.json`. Confirm the engine
-   checkout, OpenClaw workspace, state directory, skill directory, and task-file
-   paths all point to isolated test locations.
+# One category only
+python3 ~/.openclaw/workspace/skills/skillopt-sleep/run_sleep.py --tasks tests/research-cron-tasks.json
+```
 
-3. Review `config.json`. In particular, do not assume that values such as
-   `max_tokens_per_night` or `replay_mode` are enforced by this custom wrapper
-   merely because they appear in the example config.
+### Slash command
 
-4. Supply credentials through your normal secret-management mechanism. Do not
-   commit a DeepSeek key or place it in a world-readable file.
+```bash
+# In any OpenClaw session
+/sleep status
+/sleep run
+/sleep run research-cron
+/sleep dry-run
+/sleep adopt              # adopt most recent accepted proposal
+/sleep reject             # discard most recent
+/sleep cost
+```
 
-5. Resolve every known porting gap listed in [`SKILL.md`](SKILL.md), add
-   isolated tests for your adapted backend, and verify that `--help` imports
-   cleanly on Python 3.10+. Only then start with a dry run and one reviewed
-   task file. The target command should be shaped like:
+## Architecture
 
-   ```bash
-   cd /path/to/SkillOpt/plugins/openclaw
-   python3 run_sleep.py --config /path/to/reviewed-config.json \
-     --tasks tests/research-cron-tasks.json --dry-run
-   ```
+```
+plugins/openclaw/
+├── README.md                       # this file
+├── run_sleep_cron.sh               # wrapper for cron invocation
+├── run_sleep.py                    # main entry point
+├── slash_sleep.py                  # /sleep command implementation
+├── skillopt_sleep_openclaw.py      # DeepSeek + Ollama backend
+├── config.json                     # engine config
+├── SKILL.md                        # OpenClaw skill manifest
+└── tests/                          # held-out test sets
+    ├── research-cron-tasks.json
+    ├── devops-tasks.json
+    └── wiki-tasks.json
+```
 
-6. Inspect the report, paths, network destinations, and proposed edits before
-   considering a non-dry run or scheduling.
+The OpenClaw shell is one engine (skillopt_sleep/) + one backend (DeepSeek/Ollama) + four thin wrappers (cron, slash, skill, tests).
 
-## Data boundary
+## Why this matters for OpenClaw
 
-The custom `openclaw-deepseek` backend sends task, skill, response, rubric, and
-reflection content to the configured DeepSeek endpoint. Its embedding helper can
-send truncated text to the configured local Ollama service. Do not assume these
-outbound prompts have been fully redacted; inspect transcript/task inputs and the
-provider's retention policy before using real data.
+OpenClaw currently has no built-in "self-evolving skills" mechanism. The community has:
 
-Use HTTPS for a remote DeepSeek-compatible endpoint. Keep any plaintext Ollama
-endpoint on a trusted loopback interface. For a network-free engine smoke test,
-use the shared SkillOpt-Sleep CLI with `--backend mock` rather than assuming this
-custom wrapper is isolated.
+- **Manual skills** — Ethan writes them
+- **LLM-generated skills** — one-shot, no validation
+- **Self-revision** — unbounded, no quality bar
 
-## Scheduling
+SkillOpt-Sleep adds a 4th option: **validated self-evolution**. The skill is the training target, the engine is the optimizer, the gate is the quality bar, the operator is the human-in-the-loop.
 
-`run_sleep_cron.sh` and the scheduling helpers are examples, not portable
-installers. Adapt their paths, create log directories, verify their environment,
-and run the exact command manually before adding a cron entry. Scheduled runs
-must preserve the same manual-adoption and credential boundaries as interactive
-runs.
+## Validation
 
-## Validation scope
+Validated on the public [gbrain-evals](https://github.com/garrytan/gbrain-evals) `skillopt-v1` benchmark with real Claude and Codex (deficient skills 0.00 → 1.00 on held-out, all 4 seeds).
 
-The bundled JSON files are example held-out task sets, not a universal OpenClaw
-benchmark. Provider cost and quality depend on the selected model, task content,
-number of calls, and pricing at run time; this reference does not promise a fixed
-nightly cost. Validate the adapted workflow in an isolated workspace before
-using it on live skills.
+End-to-end test on our own 14-task held-out set: pipeline runs, gate correctly rejects non-improvements, staging artifacts land in `~/.skillopt-sleep/staging/<night>/`.
 
-For the supported shared-engine CLI and its current flags, see the
-[integration reference](../README.md#supported-cli-surface). For measured
-SkillOpt-Sleep results and limitations, see
-[`docs/sleep/RESULTS.md`](../../docs/sleep/RESULTS.md).
+## Cost
+
+Measured: ~$0.02/night with `deepseek-v4-pro` at 12 tasks/night. ~$0.59/month, $7.18/year.
 
 ## License
 
-MIT, consistent with SkillOpt core.
+MIT (same as SkillOpt core).

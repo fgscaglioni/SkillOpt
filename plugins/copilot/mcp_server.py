@@ -38,48 +38,16 @@ TOOLS = [
      "description": "Apply the latest staged proposal to CLAUDE.md/SKILL.md (backs up first)."},
     {"name": "sleep_harvest", "action": "harvest",
      "description": "Debug: list the recurring tasks mined from recent sessions."},
-    {"name": "sleep_schedule", "action": "schedule",
-     "description": "Install a nightly cron entry to run the sleep cycle automatically."},
-    {"name": "sleep_unschedule", "action": "unschedule",
-     "description": "Remove the nightly cron entry for a project."},
 ]
 _BY_NAME = {t["name"]: t for t in TOOLS}
 
 _TOOL_SCHEMA = {
     "type": "object",
     "properties": {
-        "project": {"type": "string",
-                     "description": "Project dir to evolve (default: cwd)."},
-        "backend": {"type": "string", "enum": ["mock", "claude", "codex", "copilot"],
-                     "description": "mock = no API spend (default); claude/codex/copilot = real."},
-        "scope": {"type": "string", "enum": ["invoked", "all"],
-                  "description": "Harvest scope (default: invoked project only)."},
-        "source": {"type": "string", "enum": ["claude", "codex", "auto"],
-                   "description": "Transcript source (default: claude)."},
-        "model": {"type": "string",
-                  "description": "Backend-specific model override."},
-        "tasks_file": {"type": "string",
-                       "description": "Path to reviewed TaskRecord JSON (skips harvest)."},
-        "target_skill_path": {"type": "string",
-                              "description": "Explicit SKILL.md path to evolve/stage/adopt."},
-        "progress": {"type": "boolean",
-                     "description": "Print phase progress to stderr."},
-        "max_sessions": {"type": "integer",
-                         "description": "Cap harvested sessions per run."},
-        "max_tasks": {"type": "integer",
-                      "description": "Cap mined tasks per run."},
-        "lookback_hours": {"type": "integer",
-                           "description": "Harvest window in hours (default: 72)."},
-        "auto_adopt": {"type": "boolean",
-                       "description": "Auto-adopt if gate passes (default: false)."},
-        "json": {"type": "boolean",
-                 "description": "Return machine-readable JSON output."},
-        "edit_budget": {"type": "integer",
-                        "description": "Max bounded edits per night (default: 4)."},
-        "hour": {"type": "integer",
-                 "description": "Hour for schedule (0-23, default: 3)."},
-        "minute": {"type": "integer",
-                   "description": "Minute for schedule (0-59, default: 17)."},
+        "project": {"type": "string", "description": "Project dir to evolve (default: cwd)."},
+        "backend": {"type": "string", "enum": ["mock", "claude", "codex"],
+                     "description": "mock = no API spend (default); claude/codex = real."},
+        "scope": {"type": "string", "enum": ["invoked", "all"]},
     },
     "additionalProperties": False,
 }
@@ -88,35 +56,15 @@ _TOOL_SCHEMA = {
 def _run_engine(action: str, args: dict) -> str:
     py = sys.executable or "python3"
     cmd = [py, "-m", "skillopt_sleep", action]
-    # String-valued flags
-    for flag, key in [
-        ("--project", "project"), ("--backend", "backend"),
-        ("--scope", "scope"), ("--source", "source"),
-        ("--model", "model"), ("--tasks-file", "tasks_file"),
-        ("--target-skill-path", "target_skill_path"),
-    ]:
-        val = args.get(key)
-        if val:
-            cmd += [flag, str(val)]
-    # Integer-valued flags
-    for flag, key in [
-        ("--max-sessions", "max_sessions"), ("--max-tasks", "max_tasks"),
-        ("--lookback-hours", "lookback_hours"), ("--edit-budget", "edit_budget"),
-        ("--hour", "hour"), ("--minute", "minute"),
-    ]:
-        val = args.get(key)
-        if val is not None:
-            cmd += [flag, str(int(val))]
-    # Boolean flags
-    for flag, key in [
-        ("--progress", "progress"), ("--auto-adopt", "auto_adopt"),
-        ("--json", "json"),
-    ]:
-        if args.get(key):
-            cmd.append(flag)
+    if args.get("project"):
+        cmd += ["--project", str(args["project"])]
+    if args.get("backend"):
+        cmd += ["--backend", str(args["backend"])]
+    if args.get("scope"):
+        cmd += ["--scope", str(args["scope"])]
     try:
         proc = subprocess.run(cmd, cwd=REPO_ROOT, capture_output=True, text=True, timeout=3600)
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         return f"[error] failed to run engine: {e}"
     out = (proc.stdout or "").strip()
     err = (proc.stderr or "").strip()

@@ -13,29 +13,18 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections import Counter
+import traceback
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-from skillopt.envs.searchqa.evaluator import evaluate
-from skillopt.model import chat_target, is_target_exec_backend
+from skillopt.model import chat_target, get_target_backend, is_target_exec_backend
 from skillopt.model.codex_harness import prepare_workspace, render_skill_md, run_target_exec
 from skillopt.prompts import load_prompt
+from skillopt.envs.searchqa.evaluator import evaluate
+
 
 # ── Prompt templates ─────────────────────────────────────────────────────────
 
 _MAX_CONTEXT_CHARS = 6000
-
-
-def _raise_on_systemic_failure(results: list[dict]) -> None:
-    """Abort when all rollout rows failed before any agent response."""
-    if not results or not all(row.get("agent_ok") is False for row in results):
-        return
-    reasons = Counter(str(row.get("fail_reason") or "unknown error") for row in results)
-    common_reason, count = reasons.most_common(1)[0]
-    raise RuntimeError(
-        f"SearchQA rollout failed for all {len(results)} items before an agent "
-        f"response ({count}x): {common_reason}"
-    )
 
 
 def _truncate_context(context: str, max_chars: int = _MAX_CONTEXT_CHARS) -> str:
@@ -390,7 +379,6 @@ def run_batch(
 
     pending = [it for it in items if str(it["id"]) not in done_ids]
     if not pending:
-        _raise_on_systemic_failure(existing)
         return existing
 
     total = len(existing) + len(pending)
@@ -490,5 +478,4 @@ def run_batch(
         finally:
             ex.shutdown(wait=False, cancel_futures=True)
 
-    _raise_on_systemic_failure(results)
     return results

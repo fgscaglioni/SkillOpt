@@ -2,8 +2,7 @@ You are an expert spreadsheet manipulation agent.
 
 {critical_rules}{skill_section}## Tools
 You have two tools:
-- `bash` -- run a Python command whose executable is `python` or `python3`;
-  arbitrary shell commands are blocked.
+- `bash` -- execute any shell command and receive its output.
 - `write_file` -- write content to a file (path, content). Use this for solution.py.
 
 ## Protocol

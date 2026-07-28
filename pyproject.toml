@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "skillopt"
-version = "0.2.0"
+version = "0.1.0"
 description = "SkillOpt: Agentic Skill Optimization via Reflective Training Loops"
 readme = "README.md"
 license = {text = "MIT"}
@@ -37,11 +37,9 @@ dependencies = [
 # Benchmark-specific dependencies
 alfworld = ["alfworld>=0.4.0", "gymnasium>=0.29.0"]
 # Claude model backend
-claude = ["claude-agent-sdk>=0.1.0", "json_repair>=0.61.0"]
+claude = ["claude-agent-sdk>=0.1.0"]
 # Qwen local model backend (via vLLM)
-qwen = ["vllm>=0.4.0", "json_repair>=0.61.0"]
-# SearchQA data materialization
-searchqa = ["datasets>=2.18.0"]
+qwen = ["vllm>=0.4.0"]
 # Documentation site
 docs = ["mkdocs-material>=9.5.0", "mkdocstrings[python]>=0.24.0"]
 # WebUI dashboard
@@ -53,13 +51,11 @@ all = [
     "alfworld>=0.4.0",
     "gymnasium>=0.29.0",
     "claude-agent-sdk>=0.1.0",
-    "json_repair>=0.61.0",
 ]
 
 [project.scripts]
 skillopt-train = "scripts.train:main"
 skillopt-eval = "scripts.eval_only:main"
-skillopt-sleep = "skillopt_sleep.__main__:main"
 
 [project.urls]
 Homepage = "https://github.com/microsoft/SkillOpt"
@@ -68,13 +64,9 @@ Repository = "https://github.com/microsoft/SkillOpt"
 Issues = "https://github.com/microsoft/SkillOpt/issues"
 
 [tool.setuptools.packages.find]
-# skillopt*      = the research package
-# skillopt_sleep = the open-source Sleep tool (decoupled, zero research dep)
-# skillopt_webui = the Gradio dashboard (installed via the `webui` extra)
-include = ["skillopt", "skillopt.*", "skillopt_sleep", "skillopt_sleep.*", "skillopt_webui", "skillopt_webui.*", "scripts*"]
-
-[tool.setuptools.package-data]
-"*" = ["*.md"]
+# skillopt* = the research package; skillopt_sleep = the open-source Sleep tool
+# (decoupled, zero dependency on the research code).
+include = ["skillopt", "skillopt.*", "skillopt_sleep", "skillopt_sleep.*", "scripts*"]
 
 [tool.ruff]
 line-length = 120

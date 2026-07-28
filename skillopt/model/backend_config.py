@@ -28,8 +28,6 @@ CLAUDE_CODE_EXEC_PATH = os.environ.get("CLAUDE_CODE_EXEC_PATH", "claude")
 CLAUDE_CODE_EXEC_PROFILE = os.environ.get("CLAUDE_CODE_EXEC_PROFILE", "")
 CLAUDE_CODE_EXEC_USE_SDK = os.environ.get("CLAUDE_CODE_EXEC_USE_SDK", "auto")
 CLAUDE_CODE_EXEC_EFFORT = os.environ.get("CLAUDE_CODE_EXEC_EFFORT", "medium")
-CURSOR_EXEC_PATH = os.environ.get("CURSOR_EXEC_PATH", "cursor-agent")
-CURSOR_EXEC_SANDBOX = os.environ.get("CURSOR_EXEC_SANDBOX", "enabled")
 
 
 def _parse_int(value: str | None, default: int) -> int:
@@ -51,18 +49,10 @@ CLAUDE_CODE_EXEC_MAX_THINKING_TOKENS = max(
 def set_optimizer_backend(backend: str) -> None:
     global OPTIMIZER_BACKEND
     OPTIMIZER_BACKEND = normalize_backend_name(backend or "openai_chat")
-    if OPTIMIZER_BACKEND not in {
-        "openai_chat",
-        "claude_chat",
-        "qwen_chat",
-        "minimax_chat",
-        "openai_compatible",
-        "codex_exec",
-    }:
+    if OPTIMIZER_BACKEND not in {"openai_chat", "claude_chat", "qwen_chat", "minimax_chat"}:
         raise ValueError(
             f"Unsupported optimizer backend: {OPTIMIZER_BACKEND!r}. "
-            "Supported values are 'openai_chat', 'claude_chat', 'qwen_chat', 'minimax_chat', "
-            "'openai_compatible', and 'codex_exec'."
+            "Supported values are 'openai_chat', 'claude_chat', 'qwen_chat', and 'minimax_chat'."
         )
     os.environ["OPTIMIZER_BACKEND"] = OPTIMIZER_BACKEND
 
@@ -74,11 +64,10 @@ def get_optimizer_backend() -> str:
 def set_target_backend(backend: str) -> None:
     global TARGET_BACKEND
     TARGET_BACKEND = normalize_backend_name(backend or "openai_chat")
-    if TARGET_BACKEND not in {"openai_chat", "claude_chat", "qwen_chat", "minimax_chat", "openai_compatible", "codex_exec", "claude_code_exec", "cursor_exec"}:
+    if TARGET_BACKEND not in {"openai_chat", "claude_chat", "qwen_chat", "minimax_chat", "codex_exec", "claude_code_exec"}:
         raise ValueError(
             f"Unsupported target backend: {TARGET_BACKEND!r}. "
-            "Supported values are 'openai_chat', 'claude_chat', 'qwen_chat', 'minimax_chat', "
-            "'openai_compatible', 'codex_exec', 'claude_code_exec', and 'cursor_exec'."
+            "Supported values are 'openai_chat', 'claude_chat', 'qwen_chat', 'minimax_chat', 'codex_exec', and 'claude_code_exec'."
         )
     os.environ["TARGET_BACKEND"] = TARGET_BACKEND
 
@@ -88,22 +77,15 @@ def get_target_backend() -> str:
 
 
 def is_target_exec_backend() -> bool:
-    return TARGET_BACKEND in {"codex_exec", "claude_code_exec", "cursor_exec"}
+    return TARGET_BACKEND in {"codex_exec", "claude_code_exec"}
 
 
 def is_optimizer_chat_backend() -> bool:
-    return OPTIMIZER_BACKEND in {
-        "openai_chat",
-        "claude_chat",
-        "qwen_chat",
-        "minimax_chat",
-        "openai_compatible",
-        "codex_exec",
-    }
+    return OPTIMIZER_BACKEND in {"openai_chat", "claude_chat", "qwen_chat", "minimax_chat"}
 
 
 def is_target_chat_backend() -> bool:
-    return TARGET_BACKEND in {"openai_chat", "claude_chat", "qwen_chat", "minimax_chat", "openai_compatible"}
+    return TARGET_BACKEND in {"openai_chat", "claude_chat", "qwen_chat", "minimax_chat"}
 
 
 def configure_codex_exec(
@@ -199,32 +181,5 @@ def get_claude_code_exec_config() -> dict[str, str | int]:
         "use_sdk": CLAUDE_CODE_EXEC_USE_SDK,
         "effort": CLAUDE_CODE_EXEC_EFFORT,
         "max_thinking_tokens": CLAUDE_CODE_EXEC_MAX_THINKING_TOKENS,
-        "empty_response_retries": EXEC_EMPTY_RESPONSE_RETRIES,
-    }
-
-
-def configure_cursor_exec(
-    *,
-    path: str | None = None,
-    sandbox: str | None = None,
-) -> None:
-    global CURSOR_EXEC_PATH, CURSOR_EXEC_SANDBOX
-    if path is not None:
-        CURSOR_EXEC_PATH = str(path).strip() or "cursor-agent"
-        os.environ["CURSOR_EXEC_PATH"] = CURSOR_EXEC_PATH
-    if sandbox is not None:
-        normalized_sandbox = str(sandbox).strip().lower() or "enabled"
-        if normalized_sandbox not in {"enabled", "disabled"}:
-            raise ValueError("cursor_exec sandbox must be 'enabled' or 'disabled'")
-        CURSOR_EXEC_SANDBOX = normalized_sandbox
-        os.environ["CURSOR_EXEC_SANDBOX"] = CURSOR_EXEC_SANDBOX
-
-
-def get_cursor_exec_config() -> dict[str, str | int]:
-    if CURSOR_EXEC_SANDBOX not in {"enabled", "disabled"}:
-        raise ValueError("cursor_exec sandbox must be 'enabled' or 'disabled'")
-    return {
-        "path": CURSOR_EXEC_PATH,
-        "sandbox": CURSOR_EXEC_SANDBOX,
         "empty_response_retries": EXEC_EMPTY_RESPONSE_RETRIES,
     }

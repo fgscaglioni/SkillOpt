@@ -12,7 +12,7 @@ Pipeline stages:
   6. Evaluate  — validate candidate skill, accept/reject
 """
 
-__version__ = "0.2.0"
+__version__ = "0.1.0"
 
 from skillopt.types import (  # noqa: F401
     BatchSpec,

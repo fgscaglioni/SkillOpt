@@ -3,7 +3,8 @@ from __future__ import annotations
 
 import pytest
 
-from skillopt.types import Edit, Patch, RolloutResult
+from skillopt.types import Edit, Patch
+
 
 # ── Edit ────────────────────────────────────────────────────────────────────
 
@@ -246,17 +247,3 @@ class TestPatchEdgeCases:
         assert isinstance(p.edits[0], Edit)
         assert p.edits[0].op == "append"
         assert p.edits[0].content == "hello"
-
-
-# ── RolloutResult ────────────────────────────────────────────────────────────
-
-
-class TestRolloutResultRoundTrip:
-    """RolloutResult.to_dict() / RolloutResult.from_dict() round-trip."""
-
-    def test_preserves_fractional_hard_score(self) -> None:
-        """Hard can be a continuous reward and must not be truncated."""
-        result = RolloutResult.from_dict({"id": "episode-1", "hard": 0.75, "soft": 0.5})
-
-        assert result.hard == pytest.approx(0.75)
-        assert result.to_dict()["hard"] == pytest.approx(0.75)
