@@ -13,8 +13,8 @@ Common flags:
     --max-tasks N       cap mined tasks per run
     --target-skill-path PATH explicit live SKILL.md to stage/adopt
     --tasks-file PATH   reviewed TaskRecord JSON file to replay instead of harvesting
-    --backend mock|claude|codex|copilot|cursor|handoff
-    --source claude|codex|cursor|auto
+    --backend mock|claude|codex|copilot|hermes|cursor|handoff
+    --source claude|codex|auto|hermes|cursor
     --model NAME
     --lookback-hours N
     --auto-adopt
@@ -71,7 +71,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--project", default="")
     p.add_argument("--scope", default="", choices=["", "all", "invoked"])
     p.add_argument("--backend", default="",
-                   choices=["", "mock", "claude", "codex", "copilot", "cursor", "handoff",
+                   choices=["", "mock", "claude", "codex", "copilot", "hermes", "cursor", "handoff",
                             "azure_openai"])
     p.add_argument("--model", default="")
     p.add_argument("--codex-path", default="", help="path to the real @openai/codex binary")
@@ -79,7 +79,7 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--claude-home", default="", help="override ~/.claude (also isolates state)")
     p.add_argument("--codex-home", default="", help="override ~/.codex for archived session harvest")
     p.add_argument("--cursor-home", default="", help="override ~/.cursor for Cursor session harvest")
-    p.add_argument("--source", default="", choices=["", "claude", "codex", "cursor", "auto"],
+    p.add_argument("--source", default="", choices=["", "claude", "codex", "cursor", "auto", "hermes"],
                    help="session transcript source")
     p.add_argument("--lookback-hours", type=int, default=None,
                    help="harvest window in hours; 0 = scan full history")

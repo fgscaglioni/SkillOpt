@@ -27,6 +27,7 @@ _BACKEND_DEFAULT_MODELS = {
     "cursor_exec": "composer-2.5",
     "qwen_chat": "Qwen/Qwen3.5-4B",
     "minimax_chat": "MiniMax-M2.7",
+    "hermes_chat": "hermes",
     "openai_compatible": "gpt-4o-mini",
 }
 
@@ -49,6 +50,8 @@ _BACKEND_ALIASES = {
     "qwen_chat": "qwen_chat",
     "minimax": "minimax_chat",
     "minimax_chat": "minimax_chat",
+    "hermes": "hermes_chat",
+    "hermes_chat": "hermes_chat",
     "openai_compatible": "openai_compatible",
     "openai_compatible_chat": "openai_compatible",
     "openai-compatible": "openai_compatible",

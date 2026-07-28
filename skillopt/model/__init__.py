@@ -7,6 +7,7 @@ from typing import Any
 from skillopt.model import azure_openai as _openai
 from skillopt.model import claude_backend as _claude
 from skillopt.model import codex_backend as _codex
+from skillopt.model import hermes_backend as _hermes
 from skillopt.model import minimax_backend as _minimax
 from skillopt.model import openai_compatible_backend as _openai_compat
 from skillopt.model import qwen_backend as _qwen
@@ -67,6 +68,10 @@ def set_backend(name: str | None) -> str:
         set_optimizer_backend("openai_chat")
         set_target_backend("minimax_chat")
         return "minimax_chat"
+    if normalized in {"hermes", "hermes_chat"}:
+        set_optimizer_backend("hermes_chat")
+        set_target_backend("hermes_chat")
+        return "hermes_chat"
     if normalized in {"openai_compatible", "openai_compatible_chat", "openai-compatible", "compat"}:
         set_optimizer_backend("openai_compatible")
         set_target_backend("openai_compatible")
@@ -90,6 +95,8 @@ def get_backend_name() -> str:
         return "qwen_chat"
     if optimizer == "openai_chat" and target == "minimax_chat":
         return "minimax_chat"
+    if optimizer == "hermes_chat" and target == "hermes_chat":
+        return "hermes_chat"
     if optimizer == "openai_chat" and target == "cursor_exec":
         return "cursor_exec"
     if optimizer == "openai_compatible" and target == "openai_compatible":
@@ -123,6 +130,15 @@ def chat_optimizer(
             retries=retries,
             stage=stage,
             reasoning_effort=reasoning_effort,
+            timeout=timeout,
+        )
+    if get_optimizer_backend() == "hermes_chat":
+        return _hermes.chat_optimizer(
+            system=system,
+            user=user,
+            max_completion_tokens=max_completion_tokens,
+            retries=retries,
+            stage=stage,
             timeout=timeout,
         )
     if get_optimizer_backend() == "minimax_chat":
@@ -202,6 +218,15 @@ def chat_target(
             stage=stage,
             reasoning_effort=reasoning_effort,
         )
+    if get_target_backend() == "hermes_chat":
+        return _hermes.chat_target(
+            system=system,
+            user=user,
+            max_completion_tokens=max_completion_tokens,
+            retries=retries,
+            stage=stage,
+            timeout=timeout,
+        )
     if get_target_backend() == "openai_compatible":
         return _openai_compat.chat_target(
             system=system,
@@ -258,6 +283,17 @@ def chat_optimizer_messages(
             retries=retries,
             stage=stage,
             reasoning_effort=reasoning_effort,
+            tools=tools,
+            tool_choice=tool_choice,
+            return_message=return_message,
+            timeout=timeout,
+        )
+    if get_optimizer_backend() == "hermes_chat":
+        return _hermes.chat_optimizer_messages(
+            messages=messages,
+            max_completion_tokens=max_completion_tokens,
+            retries=retries,
+            stage=stage,
             tools=tools,
             tool_choice=tool_choice,
             return_message=return_message,
@@ -357,6 +393,17 @@ def chat_target_messages(
             tool_choice=tool_choice,
             return_message=return_message,
         )
+    if get_target_backend() == "hermes_chat":
+        return _hermes.chat_target_messages(
+            messages=messages,
+            max_completion_tokens=max_completion_tokens,
+            retries=retries,
+            stage=stage,
+            tools=tools,
+            tool_choice=tool_choice,
+            return_message=return_message,
+            timeout=timeout,
+        )
     if get_target_backend() == "openai_compatible":
         return _openai_compat.chat_target_messages(
             messages=messages,
@@ -400,6 +447,23 @@ def chat_messages_with_deployment(
     return_message: bool = False,
     timeout: int | None = None,
 ) -> tuple[Any, dict]:
+    if get_optimizer_backend() == "hermes_chat" and get_target_backend() == "hermes_chat":
+        # Route to Hermes only when BOTH backends are hermes_chat.  When only
+        # one side is hermes_chat (dual-backend scenario) the function routes
+        # to OpenAI, which handles both sides via the generic OpenAI backend.
+        # A deployment-level ``role`` parameter would be cleaner but requires
+        # a broader API change — see the sibling function below.
+        return _hermes.chat_messages_with_deployment(
+            deployment=deployment,
+            messages=messages,
+            max_completion_tokens=max_completion_tokens,
+            retries=retries,
+            stage=stage,
+            tools=tools,
+            tool_choice=tool_choice,
+            return_message=return_message,
+            timeout=timeout,
+        )
     return _openai.chat_messages_with_deployment(
         deployment=deployment,
         messages=messages,
@@ -424,6 +488,18 @@ def chat_with_deployment(
     reasoning_effort: str | None = None,
     timeout: int | None = None,
 ) -> tuple[str, dict]:
+    if get_optimizer_backend() == "hermes_chat" and get_target_backend() == "hermes_chat":
+        # Route to Hermes only when BOTH backends are hermes_chat.  Same
+        # rationale as chat_messages_with_deployment above.
+        return _hermes.chat_with_deployment(
+            deployment=deployment,
+            system=system,
+            user=user,
+            max_completion_tokens=max_completion_tokens,
+            retries=retries,
+            stage=stage,
+            timeout=timeout,
+        )
     return _openai.chat_with_deployment(
         deployment=deployment,
         system=system,
@@ -462,6 +538,17 @@ def get_token_summary() -> dict:
         summary[stage]["total_tokens"] += values["total_tokens"]
     minimax_summary = _minimax.get_token_summary()
     for stage, values in minimax_summary.items():
+        if stage == "_total":
+            continue
+        if stage not in summary:
+            summary[stage] = values
+            continue
+        summary[stage]["calls"] += values["calls"]
+        summary[stage]["prompt_tokens"] += values["prompt_tokens"]
+        summary[stage]["completion_tokens"] += values["completion_tokens"]
+        summary[stage]["total_tokens"] += values["total_tokens"]
+    hermes_summary = _hermes.get_token_summary()
+    for stage, values in hermes_summary.items():
         if stage == "_total":
             continue
         if stage not in summary:
@@ -515,6 +602,7 @@ def reset_token_tracker() -> None:
     _claude.reset_token_tracker()
     _qwen.reset_token_tracker()
     _minimax.reset_token_tracker()
+    _hermes.reset_token_tracker()
     _openai_compat.reset_token_tracker()
     _codex.reset_token_tracker()
 
@@ -666,6 +754,7 @@ def set_reasoning_effort(effort: str | None) -> None:
     _claude.set_reasoning_effort(effort)
     _qwen.set_reasoning_effort(effort)
     _minimax.set_reasoning_effort(effort)
+    _hermes.set_reasoning_effort(effort)
     _openai_compat.set_reasoning_effort(effort)
     _codex.set_reasoning_effort(effort)
 
@@ -675,6 +764,7 @@ def set_target_deployment(deployment: str) -> None:
     _claude.set_target_deployment(deployment)
     _qwen.set_target_deployment(deployment)
     _minimax.set_target_deployment(deployment)
+    _hermes.set_target_deployment(deployment)
     _openai_compat.set_target_deployment(deployment)
     _codex.set_target_deployment(deployment)
 
@@ -683,5 +773,6 @@ def set_optimizer_deployment(deployment: str) -> None:
     _openai.set_optimizer_deployment(deployment)
     _claude.set_optimizer_deployment(deployment)
     _qwen.set_optimizer_deployment(deployment)
+    _hermes.set_optimizer_deployment(deployment)
     _openai_compat.set_optimizer_deployment(deployment)
     _codex.set_optimizer_deployment(deployment)
