@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from skillopt_sleep.backend import Backend
-from skillopt_sleep.memory import apply_edits
+from skillopt_sleep.memory import apply_edits_detailed
 from skillopt_sleep.replay import aggregate_scores, replay_batch
 from skillopt_sleep.types import EditRecord, ReplayResult, TaskRecord
 
@@ -37,6 +37,11 @@ class ConsolidationResult:
     holdout_baseline: float
     holdout_candidate: float
     # ── observability (so a 0.0->0.0 night is self-diagnosing, not a black box) ──
+    # Edits that changed nothing (anchor not found, or a duplicate add). They are
+    # neither applied nor gate-rejected, so without this list they would vanish
+    # from the report and the night would look like the optimizer produced less
+    # than it did.
+    unmatched_edits: List[EditRecord] = field(default_factory=list)
     holdout_detail: List[dict] = field(default_factory=list)  # per val task: hard/soft/resp/why
     reflect_raw: str = ""        # the optimizer's last raw reply (empty => reflect produced nothing)
     call_error: str = ""         # backend's last call error (timeout/auth/empty)
@@ -54,12 +59,13 @@ def _split(tasks: List[TaskRecord]) -> Tuple[List[TaskRecord], List[TaskRecord]]
 
     train = [t for t in tasks if _norm(t.split) == "train"]
     val = [t for t in tasks if _norm(t.split) == "val"]
-    # be robust if a split is empty: fall back so a night still does something,
-    # but never silently use test as val.
-    test = [t for t in tasks if _norm(t.split) == "test"]
+    # Be robust if a split is empty: fall back so a night still does something,
+    # but never silently use test as train or val. An all-test batch therefore
+    # returns empty train/val (caller scores test separately; gate is a no-op).
     if not val:
-        # prefer train as the gate reference over nothing; last resort all-but-test
-        val = train or [t for t in tasks if _norm(t.split) != "test"] or tasks
+        # Prefer train as the gate reference; otherwise any non-test tasks.
+        # Do not fall back to the full task list (that would leak held-out test).
+        val = train or [t for t in tasks if _norm(t.split) != "test"]
     if not train:
         train = val
     return train, val
@@ -108,6 +114,8 @@ def consolidate(
 
     Skill and memory are evolved in sequence (skill first if both enabled).
     """
+    from skillopt_sleep import evidence as evlog
+    ev = evlog.get(backend)
     train_tasks, val_tasks = _split(tasks)
     gate_off = str(gate_mode).strip().lower() in {"off", "none", "false", "greedy"}
     holdout_detail: List[dict] = []
@@ -120,12 +128,19 @@ def consolidate(
     if gate_off:
         base_hard, base_soft = 0.0, 0.0
     else:
+        evlog.set_phase(backend, "baseline_val")
         base_pairs = replay_batch(backend, val_tasks, skill, memory)
         base_hard, base_soft = aggregate_scores(base_pairs)
         holdout_detail = _holdout_detail(base_pairs)
     base_score = select_gate_score(base_hard, base_soft, gate_metric, gate_mixed_weight)
+    if ev is not None:
+        ev.log("gate", "baseline", gate_mode=("off" if gate_off else "on"),
+               n_train=len(train_tasks), n_val=len(val_tasks),
+               hard=base_hard, soft=base_soft, score=base_score,
+               metric=gate_metric, mixed_weight=gate_mixed_weight)
 
     # ── reflect over TRAIN-split failures/successes ───────────────────────
+    evlog.set_phase(backend, "train")
     train_pairs = replay_batch(backend, train_tasks, skill, memory)
     failures = [(t, r) for (t, r) in train_pairs if r.hard < 1.0]
     successes = [(t, r) for (t, r) in train_pairs if r.hard >= 1.0]
@@ -133,25 +148,48 @@ def consolidate(
     cand_skill, cand_memory = skill, memory
     all_applied: List[EditRecord] = []
     all_rejected: List[EditRecord] = []
+    all_unmatched: List[EditRecord] = []
+
+    def _edits_payload(edits: List[EditRecord]) -> List[dict]:
+        return [{"op": e.op, "content": e.content, "anchor": e.anchor,
+                 "rationale": e.rationale} for e in edits]
 
     def _gate_apply(doc: str, edits: List[EditRecord], which: str) -> str:
         nonlocal cand_skill, cand_memory, base_score, all_applied, all_rejected
+        if ev is not None:
+            ev.log("reflect", "edits_returned", target=which,
+                   n_edits=len(edits), edits=_edits_payload(edits))
         if not edits:
             return doc
-        new_doc, applied = apply_edits(doc, edits)
+        new_doc, applied, unmatched = apply_edits_detailed(doc, edits)
+        if unmatched:
+            all_unmatched.extend(unmatched)
+            if ev is not None:
+                ev.log("reflect", "edits_unmatched", target=which,
+                       n_edits=len(unmatched), edits=_edits_payload(unmatched))
         if not applied:
             return doc
         # gate OFF: accept greedily with NO val scoring (the daily-use path)
         if gate_off:
             all_applied.extend(applied)
+            if ev is not None:
+                ev.log("gate", "trial", target=which, mode="greedy",
+                       accepted=True, n_edits=len(applied))
             return new_doc
         # gate ON: score the candidate on the VAL slice, keep only if it improves
         trial_skill = new_doc if which == "skill" else cand_skill
         trial_memory = new_doc if which == "memory" else cand_memory
+        evlog.set_phase(backend, f"gate_trial:{which}")
         pairs = replay_batch(backend, val_tasks, trial_skill, trial_memory)
         h, s = aggregate_scores(pairs)
         cand_score = select_gate_score(h, s, gate_metric, gate_mixed_weight)
-        if cand_score > base_score:
+        improved = cand_score > base_score
+        if ev is not None:
+            ev.log("gate", "trial", target=which, mode="gated",
+                   baseline_score=base_score, cand_hard=h, cand_soft=s,
+                   cand_score=cand_score, accepted=improved,
+                   n_edits=len(applied))
+        if improved:
             base_score = max(base_score, cand_score)
             all_applied.extend(applied)
             return new_doc
@@ -204,6 +242,7 @@ def consolidate(
 
     if evolve_memory:
         # re-evaluate failures under the (possibly improved) skill
+        evlog.set_phase(backend, "train_post_skill")
         train_pairs2 = replay_batch(backend, train_tasks, cand_skill, cand_memory)
         failures2 = [(t, r) for (t, r) in train_pairs2 if r.hard < 1.0]
         successes2 = [(t, r) for (t, r) in train_pairs2 if r.hard >= 1.0]
@@ -225,6 +264,7 @@ def consolidate(
         base_gate_score = 0.0
     else:
         # scored on the VAL slice (the gate reference)
+        evlog.set_phase(backend, "final_val")
         final_pairs = replay_batch(backend, val_tasks, cand_skill, cand_memory)
         final_hard, final_soft = aggregate_scores(final_pairs)
         final_score = select_gate_score(final_hard, final_soft, gate_metric, gate_mixed_weight)
@@ -248,6 +288,44 @@ def consolidate(
         else:
             action = "accept" if final_score > base_gate_score else "reject"
             accepted = bool(all_applied) and final_score > base_gate_score
+        # The gate scores documents, not edit bookkeeping: when every proposed
+        # edit was dropped during the per-target trials, `all_applied` is empty
+        # and nothing changed, yet the score comparison can still yield an
+        # accept-flavoured action. Reporting that as "accept_new_best" while
+        # `accepted` is False makes the headline contradict the outcome.
+        if not accepted and action in {"accept", "accept_new_best"}:
+            action = "reject"
+        # A per-target trial can improve and tentatively apply an edit, while a
+        # later fresh final replay regresses. The returned documents already
+        # roll back in that case; keep the edit bookkeeping/report consistent
+        # by moving those tentative edits into the rejected set as well.
+        if not accepted and all_applied:
+            for edit in all_applied:
+                if edit not in all_rejected:
+                    all_rejected.append(edit)
+            all_applied = []
+
+    if ev is not None:
+        w = max(0.0, min(1.0, float(gate_mixed_weight)))
+        if gate_metric == "mixed":
+            formula = (
+                f"score = (1-{w})*hard + {w}*soft; "
+                f"baseline = (1-{w})*{base_hard:.3f} + {w}*{base_soft:.3f} = {base_gate_score:.3f}; "
+                f"candidate = (1-{w})*{final_hard:.3f} + {w}*{final_soft:.3f} = {final_score:.3f}"
+            )
+        else:
+            formula = (
+                f"score = {gate_metric}; baseline = {base_gate_score:.3f}; "
+                f"candidate = {final_score:.3f}"
+            )
+        ev.log("gate", "decision", action=action, accepted=accepted,
+               baseline_score=base_gate_score, candidate_score=final_score,
+               baseline_hard=base_hard, baseline_soft=base_soft,
+               candidate_hard=final_hard, candidate_soft=final_soft,
+               metric=gate_metric, mixed_weight=gate_mixed_weight,
+               formula=formula, n_applied=len(all_applied),
+               n_rejected=len(all_rejected),
+               n_unmatched=len(all_unmatched), night=night)
 
     return ConsolidationResult(
         accepted=accepted,
@@ -258,6 +336,7 @@ def consolidate(
         new_memory=cand_memory if accepted else memory,
         applied_edits=all_applied,
         rejected_edits=all_rejected,
+        unmatched_edits=all_unmatched,
         holdout_baseline=base_hard,
         holdout_candidate=final_hard,
         holdout_detail=holdout_detail,

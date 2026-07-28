@@ -28,6 +28,7 @@ from skillopt.model import (
     configure_azure_openai,
     configure_claude_code_exec,
     configure_codex_exec,
+    configure_cursor_exec,
     configure_qwen_chat,
     configure_minimax_chat,
     set_reasoning_effort,
@@ -139,7 +140,7 @@ def parse_args() -> argparse.Namespace:
     # Legacy flat overrides
     p.add_argument("--env", type=str)
     p.add_argument("--backend", type=str,
-                   choices=["azure_openai", "codex", "codex_exec", "claude", "claude_chat", "claude_code_exec", "minimax", "minimax_chat"])
+                   choices=["azure_openai", "codex", "codex_exec", "claude", "claude_chat", "claude_code_exec", "cursor", "cursor_exec", "minimax", "minimax_chat"])
     p.add_argument("--optimizer_model", type=str)
     p.add_argument("--target_model", type=str)
     p.add_argument("--optimizer_backend", type=str)
@@ -181,6 +182,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--claude_code_exec_use_sdk", type=str)
     p.add_argument("--claude_code_exec_effort", type=str)
     p.add_argument("--claude_code_exec_max_thinking_tokens", type=int)
+    p.add_argument("--cursor_exec_path", type=str)
+    p.add_argument("--cursor_exec_sandbox", type=str)
     p.add_argument("--minimax_base_url", type=str)
     p.add_argument("--minimax_api_key", type=str)
     p.add_argument("--minimax_model", type=str)
@@ -262,6 +265,8 @@ def main() -> None:
                 "claude_code_exec_use_sdk": "model.claude_code_exec_use_sdk",
                 "claude_code_exec_effort": "model.claude_code_exec_effort",
                 "claude_code_exec_max_thinking_tokens": "model.claude_code_exec_max_thinking_tokens",
+                "cursor_exec_path": "model.cursor_exec_path",
+                "cursor_exec_sandbox": "model.cursor_exec_sandbox",
                 "minimax_base_url": "model.minimax_base_url",
                 "minimax_api_key": "model.minimax_api_key",
                 "minimax_model": "model.minimax_model",
@@ -320,11 +325,18 @@ def main() -> None:
             cfg.setdefault("optimizer_backend", "claude_chat")
             cfg.setdefault("target_backend", "claude_chat")
         elif backend in {"codex", "codex_exec"}:
-            cfg.setdefault("optimizer_backend", "openai_chat")
-            cfg.setdefault("target_backend", "codex_exec")
+            if not _has_model_override("model.optimizer_backend", "optimizer_backend"):
+                cfg["optimizer_backend"] = "codex_exec"
+            if not _has_model_override("model.target_backend", "target_backend"):
+                cfg["target_backend"] = "codex_exec"
         elif backend == "claude_code_exec":
             cfg.setdefault("optimizer_backend", "openai_chat")
             cfg.setdefault("target_backend", "claude_code_exec")
+        elif backend == "cursor_exec":
+            if not _has_model_override("model.optimizer_backend", "optimizer_backend"):
+                cfg["optimizer_backend"] = "openai_chat"
+            if not _has_model_override("model.target_backend", "target_backend"):
+                cfg["target_backend"] = "cursor_exec"
         elif backend in {"minimax", "minimax_chat"}:
             cfg.setdefault("optimizer_backend", "openai_chat")
             cfg.setdefault("target_backend", "minimax_chat")
@@ -353,6 +365,12 @@ def main() -> None:
             and not _has_model_override("model.target", "target_model")
         ):
             cfg["target_model"] = default_model_for_backend("claude_chat")
+    if cfg.get("target_backend") == "cursor_exec":
+        if (
+            str(cfg.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
+            and not _has_model_override("model.target", "target_model")
+        ):
+            cfg["target_model"] = default_model_for_backend("cursor_exec")
     if cfg.get("target_backend") == "minimax_chat":
         if (
             str(cfg.get("target_model", "") or "").strip() in _OPENAI_DEFAULT_MODEL_SENTINELS
@@ -426,6 +444,10 @@ def main() -> None:
         use_sdk=cfg.get("claude_code_exec_use_sdk", None),
         effort=cfg.get("claude_code_exec_effort", cfg.get("reasoning_effort", "medium")),
         max_thinking_tokens=cfg.get("claude_code_exec_max_thinking_tokens", 16384),
+    )
+    configure_cursor_exec(
+        path=cfg.get("cursor_exec_path") or None,
+        sandbox=cfg.get("cursor_exec_sandbox") or None,
     )
     configure_qwen_chat(
         base_url=cfg.get("qwen_chat_base_url") or None,

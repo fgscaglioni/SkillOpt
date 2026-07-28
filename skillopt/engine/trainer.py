@@ -63,6 +63,7 @@ from skillopt.model import (
     configure_azure_openai,
     configure_claude_code_exec,
     configure_codex_exec,
+    configure_cursor_exec,
     configure_minimax_chat,
     configure_qwen_chat,
     get_token_summary,
@@ -674,11 +675,16 @@ class ReflACTTrainer:
                 optimizer_backend = optimizer_backend or "claude_chat"
                 target_backend = target_backend or "claude_chat"
             elif backend in {"codex", "codex_exec"}:
-                optimizer_backend = optimizer_backend or "openai_chat"
-                target_backend = target_backend or "codex_exec"
+                if optimizer_backend in (None, "", "openai_chat"):
+                    optimizer_backend = "codex_exec"
+                if target_backend in (None, "", "openai_chat"):
+                    target_backend = "codex_exec"
             elif backend == "claude_code_exec":
                 optimizer_backend = optimizer_backend or "openai_chat"
                 target_backend = target_backend or "claude_code_exec"
+            elif backend in {"cursor", "cursor_exec"}:
+                optimizer_backend = optimizer_backend or "openai_chat"
+                target_backend = target_backend or "cursor_exec"
             elif backend in {"qwen", "qwen_chat"}:
                 optimizer_backend = optimizer_backend or "openai_chat"
                 target_backend = target_backend or "qwen_chat"
@@ -708,6 +714,10 @@ class ReflACTTrainer:
             use_sdk=cfg.get("claude_code_exec_use_sdk", None),
             effort=cfg.get("claude_code_exec_effort", cfg.get("reasoning_effort", "medium")),
             max_thinking_tokens=cfg.get("claude_code_exec_max_thinking_tokens", 16384),
+        )
+        configure_cursor_exec(
+            path=cfg.get("cursor_exec_path") or None,
+            sandbox=cfg.get("cursor_exec_sandbox") or None,
         )
         configure_qwen_chat(
             base_url=cfg.get("qwen_chat_base_url") or None,
@@ -964,6 +974,15 @@ class ReflACTTrainer:
                 f"got {gate_metric!r}"
             )
         gate_mixed_weight = float(cfg.get("gate_mixed_weight", 0.5))
+        use_semantic_density = bool(cfg.get("use_semantic_density", False))
+        semantic_density_weight = float(cfg.get("semantic_density_weight", 0.05))
+        leading_words_raw = cfg.get("leading_words", None)
+        leading_words = None
+        if leading_words_raw is not None:
+            if isinstance(leading_words_raw, str):
+                leading_words = [w.strip() for w in leading_words_raw.split(",") if w.strip()]
+            else:
+                leading_words = list(leading_words_raw)
         if not 0.0 <= gate_mixed_weight <= 1.0:
             raise ValueError(
                 f"evaluation.gate_mixed_weight must be in [0, 1], "
@@ -1003,6 +1022,10 @@ class ReflACTTrainer:
             baseline_hard, baseline_soft = compute_score(baseline_results)
             current_score = select_gate_score(
                 baseline_hard, baseline_soft, gate_metric, gate_mixed_weight,
+                skill_content=skill_init,
+                use_semantic_density=use_semantic_density,
+                semantic_density_weight=semantic_density_weight,
+                leading_words=leading_words,
             )
             best_score = current_score
             sh = skill_hash(skill_init)
@@ -1450,9 +1473,16 @@ class ReflACTTrainer:
                     cand_soft=cand_soft,
                     metric=gate_metric,
                     mixed_weight=gate_mixed_weight,
+                    use_semantic_density=use_semantic_density,
+                    semantic_density_weight=semantic_density_weight,
+                    leading_words=leading_words,
                 ) if use_gate else None
                 cand_gate_score = select_gate_score(
                     cand_hard, cand_soft, gate_metric, gate_mixed_weight,
+                    skill_content=candidate_skill,
+                    use_semantic_density=use_semantic_density,
+                    semantic_density_weight=semantic_density_weight,
+                    leading_words=leading_words,
                 )
                 if not use_gate:
                     # Validation ran (scores recorded above) but the gate is
@@ -1844,6 +1874,9 @@ class ReflACTTrainer:
                                 cand_soft=slow_sel_soft,
                                 metric=gate_metric,
                                 mixed_weight=gate_mixed_weight,
+                                use_semantic_density=use_semantic_density,
+                                semantic_density_weight=semantic_density_weight,
+                                leading_words=leading_words,
                             )
                             slow_result["selection_hard"] = slow_sel_hard
                             slow_result["selection_soft"] = slow_sel_soft
@@ -2093,6 +2126,10 @@ class ReflACTTrainer:
                     final_gate_score = select_gate_score(
                         final_selection_hard, final_selection_soft,
                         gate_metric, gate_mixed_weight,
+                        skill_content=current_skill,
+                        use_semantic_density=use_semantic_density,
+                        semantic_density_weight=semantic_density_weight,
+                        leading_words=leading_words,
                     )
                     print(
                         f"\n  [final skill val] items={fval_n} "

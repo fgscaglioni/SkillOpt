@@ -1,221 +1,230 @@
-# SkillOpt-Sleep — plugins for Claude Code, Codex, Copilot, and Devin
+# SkillOpt-Sleep integrations
 
-**Your coding agent forgets everything between sessions. SkillOpt-Sleep fixes
-that.** While you sleep, it reviews what you did today, notices the rules you
-keep repeating ("always add a LIMIT", "answers in `\boxed{}`", "cite the
-source"), and writes them into your agent's long-term memory and skills — but
-only the rules that actually make it score better on *your own* past tasks. You
-wake up to an agent that's better at *your* work, and you approve every change
-before it sticks.
+**SkillOpt-Sleep** reviews recent agent sessions, mines recurring tasks, replays
+them, and proposes bounded updates to memory and skills. A held-out validation
+gate decides whether a proposal is worth staging, and nothing live changes until
+the user explicitly adopts it.
 
-One engine, four thin shells. It synthesizes **SkillOpt** (validation-gated
-bounded text optimization — the research in this repo), **Claude Dreams**
-(offline consolidation; input never mutated; review-then-adopt), and the **agent
-sleep** idea (short-term experience → long-term competence).
+The shared engine lives in [`skillopt_sleep/`](../skillopt_sleep) and has no
+runtime dependency on the paper's `skillopt/` experiment package.
 
-> **Open-source tool, decoupled from the research.** The engine lives in the
-> top-level [`skillopt_sleep/`](../skillopt_sleep) package with **zero
-> dependency** on the paper's `skillopt/` experiment code (the validation gate is
-> vendored). Use it without the research stack.
+## Available integrations
 
----
+Five integrations wrap the shared `skillopt_sleep` CLI. OpenClaw is a separate
+reference adaptation with its own backend and setup assumptions.
 
 | Platform | Folder | Mechanism | Status |
 |---|---|---|---|
-| **Claude Code** | [`claude-code/`](claude-code) | `.claude-plugin` + `/skillopt-sleep` command + skill + hooks | full, installable |
-| **Codex** | [`codex/`](codex) | user-level `skillopt-sleep` skill + shared runner | full |
-| **Copilot** | [`copilot/`](copilot) | MCP server (`sleep_*` tools) + `copilot-instructions` | full (MCP) |
-| **Devin** | [`devin/`](devin) | MCP server (`sleep_*` tools) + Devin ATIF-v1.7 harvest + `.devin/rules` | full (MCP) |
+| **Claude Code** | [`claude-code/`](claude-code) | marketplace plugin, commands, skill, and hooks | installable shared-engine integration |
+| **Codex** | [`codex/`](codex) | user-level skill and shared runner | installable shared-engine integration |
+| **Cursor** | [`cursor/`](cursor) | native command and skill, project skill target, and shared runner | installable shared-engine integration |
+| **GitHub Copilot** | [`copilot/`](copilot) | MCP server exposing seven `sleep_*` tools | shared-engine MCP integration |
+| **Devin** | [`devin/`](devin) | MCP server plus Devin transcript conversion | shared-engine MCP integration |
+| **OpenClaw** | [`openclaw/`](openclaw) | custom DeepSeek/Ollama wrapper | independent reference adaptation; review and adapt before use |
 
-## Install (pick your agent)
+## Install
+
+Clone the repository first unless an installed `skillopt-sleep` CLI is sufficient
+for your workflow.
 
 | Platform | Install | Then |
 |---|---|---|
-| **Claude Code** | `/plugin marketplace add microsoft/SkillOpt` → `/plugin install skillopt-sleep` | `/skillopt-sleep status` |
-| **Codex** | `git clone` → `bash plugins/codex/install.sh` | `/skillopt-sleep status` |
-| **Copilot** | `git clone` → register `plugins/copilot/mcp_server.py` as an MCP server | ask "run the sleep cycle" |
-| **Devin** | `git clone` → `devin mcp add skillopt-sleep -- python3 plugins/devin/mcp_server.py` | ask "run the sleep cycle" |
+| **Claude Code** | from the repository root, `/plugin marketplace add ./plugins/claude-code`, then `/plugin install skillopt-sleep@skillopt-sleep` | `/skillopt-sleep status` |
+| **Codex** | `bash plugins/codex/install.sh` | ask Codex to use the `skillopt-sleep` skill |
+| **Cursor** | `bash plugins/cursor/install.sh` (macOS/Linux) or `powershell -File plugins/cursor/install.ps1` (Windows) | `/skillopt-sleep status` |
+| **Copilot** | register `plugins/copilot/mcp_server.py` using its example MCP config | ask Copilot to run `sleep_status` |
+| **Devin** | register `plugins/devin/mcp_server.py` using its example MCP config | ask Devin to run `sleep_status` |
+| **OpenClaw** | follow and adapt [`openclaw/README.md`](openclaw/README.md) | validate paths, credentials, and tasks locally |
 
-Requirements: Python ≥ 3.10 and the agent's CLI on PATH. All three call the same
-[`run-sleep.sh`](run-sleep.sh) → `python -m skillopt_sleep`, so behaviour is
-identical everywhere. Default backend is `mock` (no API spend); `--backend
-claude|codex|copilot` uses your own budget.
+Python 3.10 or newer is required. Real CLI backends also require the selected
+agent CLI to be installed and authenticated.
 
----
+The shared [`run-sleep.sh`](run-sleep.sh) supports both source checkouts and
+installed packages. If it cannot find the repository, it tries the
+`skillopt-sleep` executable on `PATH` (including `uv tool`/`pipx` installs), then
+an importable `skillopt_sleep` module. Install with `uv tool install skillopt` or
+`pip install skillopt` when using that fallback.
 
-## How it works: one "night", in plain terms
+> **Version note.** This integration reference tracks `main`. PyPI 0.2.0
+> supports the base Sleep CLI, while Cursor source/backend/plugin support,
+> handoff, Sleep support for non-Azure OpenAI-compatible endpoints, and
+> `--preferences` require a source checkout from `main` until the next release.
 
+## One sleep cycle
+
+```text
+harvest supported local sessions → mine recurring tasks → replay tasks
+  → reflect and propose bounded edits → validate on held-out real tasks
+  → stage proposal → (you) review and adopt
 ```
-harvest your past sessions → mine the tasks you keep doing → replay them offline
-  → reflect on failures → propose a few rule edits → KEEP only edits that raise
-    your held-out score → stage a proposal → (you) review & adopt
-```
 
-Nothing live changes until you `adopt`; every adopt backs up the prior file.
+The default backend is `mock`: it makes no provider calls and is useful for
+checking plumbing. A real backend is required for model-driven mining and genuine
+optimization.
 
-### The split that keeps it honest: dream-train / real-val / real-test
+## Data boundary
 
-This is the heart of the design, borrowed from the SkillOpt paper's
-train/selection/test protocol:
+- Harvesting is local and read-only. The `mock` backend has no model-provider
+  data path and no API spend.
+- A real backend sends truncated transcript excerpts and derived task content to
+  the provider selected for mining, replay, judging, and reflection.
+- The Cursor source reads local user/assistant message text, explicit turn
+  errors, and tool names from `~/.cursor/projects/*/agent-transcripts`; it does
+  not retain tool arguments, tool outputs, or other record types. Known
+  secret-shaped strings are redacted, but this is defense in depth rather than
+  a guarantee that outbound prompts are secret-free.
+- The Cursor backend sends prompts through the installed, authenticated
+  `cursor-agent` CLI. Ordinary calls use read-only Ask mode in a new empty
+  temporary workspace with project file access denied. Cursor tasks containing
+  `tool_called` validation fail before Agent mode starts; use another backend for
+  those tasks. Cursor and the model provider selected by Cursor can receive the
+  resulting prompt content.
+- Outbound prompts are not currently guaranteed to be free of secrets. Do not
+  use a third-party provider on sensitive transcripts without reviewing the data
+  source and the provider's retention policy.
+- For a reviewable workflow, export tasks first, inspect and redact the JSON, set
+  its top-level `"reviewed"` field to `true`, and then use the task file with a
+  real backend:
 
-| Split | Where it comes from | What it's for |
-|---|---|---|
-| **train** | your real tasks **+ optional "dreamed" variants** | what the optimizer *learns from*. Over-dreaming here is fine — it's imagination. |
-| **val** (selection) | **your real tasks only**, held out | the **gate**: an edit is kept only if it raises this score. Stops overfitting. |
-| **test** | **your real tasks only**, held out, never seen during optimization | the **final score** we report. Kept as close to your real usage as possible. |
+  ```bash
+  python -m skillopt_sleep harvest --project "$(pwd)" --output reviewed-tasks.json
+  python -m skillopt_sleep dry-run --project "$(pwd)" --backend codex \
+    --tasks-file reviewed-tasks.json --progress
+  ```
 
-So you can **dream up extra training examples** to learn a rule robustly, while
-the rule is still **judged on real, unseen tasks**. A `dream` task can *never*
-land in val or test — that invariant is unit-tested.
+  Real backends reject task files that are still marked unreviewed.
 
----
+For the separate API-key and Azure managed-identity transport boundaries, see
+[OpenAI-compatible endpoints](../docs/sleep/openai-compatible-endpoints.md).
 
-## What each feature does **for you** (with examples)
+## Supported CLI surface
 
-Every control below works on all three platforms (pass it after the action,
-e.g. `/skillopt-sleep run --rollouts-k 3`).
+Actions:
 
-### `--preferences "..."` — tell it your house rules
-
-The single most useful knob. Free text that steers what the optimizer writes,
-as a prior. Use it to encode the conventions you're tired of repeating.
-
-```bash
-# A backend engineer:
-/skillopt-sleep run --preferences "Always use async/await, never callbacks. \
-  Prefer pytest over unittest. Commit subjects in imperative mood under 50 chars."
-
-# A data analyst:
-/skillopt-sleep run --preferences "Every SQL query must end with LIMIT 1000 unless \
-  I say otherwise. Money in USD with 2 decimals. Prefer CTEs over nested subqueries."
-
-# A researcher:
-/skillopt-sleep run --preferences "Cite sources as [Author, Year]. Math answers in \
-  \\boxed{}. Keep explanations under 150 words unless I ask for depth."
-```
-*What it does for you:* the next morning your agent already follows these
-without you re-typing them, and the rules are validated against your real tasks
-(if a "preference" actually hurts your held-out score, the gate drops it).
-
-### `--gate on|off` — strict vs. greedy
-
-- `on` (default): an edit is kept **only if it raises your held-out score**.
-  Safe — blocks plausible-but-wrong rules and reward-hacking.
-- `off`: greedy — keep edits without the strict check (still reports whether
-  quality moved).
-
-*What it does for you:* leave it `on` for trust. Flip it `off` when you're
-exploring and want to see everything the optimizer proposes.
-
-### `--rollouts-k K` — learn from contrast, not just failure
-
-Re-runs each task `K` times and learns from the difference between the **good**
-and **bad** attempts, not just a single failure.
-
-```bash
-/skillopt-sleep run --rollouts-k 3
-```
-*What it does for you:* a much stronger signal. If your agent gets a task right 1
-time in 3, the optimizer figures out *what the winning attempt did* and makes it
-reliable.
-
-### `--optimizer-model` / `--target-model` — optimize cheap, deploy anywhere
-
-Use a strong model to *write* the rules and a cheap model to *run* your tasks.
-The learned skill then helps the cheap model — or any model.
-
-```bash
-/skillopt-sleep run --optimizer-model sonnet --target-model haiku
-```
-*What it does for you:* spend a little on a smart optimizer overnight; your
-everyday cheap/fast agent inherits the upgrade. (Verified: a skill optimized on
-one model lifts a different one — cross-model and even cross-runtime
-Codex↔Claude.)
-
-### `--budget-tokens N` / `--budget-minutes M` — cap the spend
-
-You decide how much the nightly "dreaming" costs; it auto-plans how many nights
-× how many rollouts fit.
-
-```bash
-/skillopt-sleep run --backend claude --budget-tokens 60000
-```
-*What it does for you:* predictable cost. It stops cleanly when the budget is hit
-and tells you what it skipped.
-
-### multi-objective (accuracy ↑, tokens ↓, latency ↓)
-
-The reward can weight not just correctness but **cost and speed**, so a skill can
-learn to be cheaper and faster, not only more accurate. *What it does for you:*
-"answer directly instead of opening five files" becomes a learned habit.
-
-### `schedule` / `unschedule` — set it and forget it
-
-Built-in nightly scheduling (no manual cron):
-
-```bash
-/skillopt-sleep schedule --hour 3 --minute 17     # runs every night for this project
-/skillopt-sleep unschedule                        # stop it
-```
-*What it does for you:* it just gets better while you sleep. The nightly run only
-*stages* a proposal — adopting is still your call (or add `--auto-adopt` when you
-schedule, if you trust it).
-
----
-
-## Full action / flag reference
-
-| Action | Does |
+| Action | Behavior |
 |---|---|
-| `status` | nights so far + the latest staged proposal (read-only) |
-| `dry-run` | harvest→mine→replay→report; **stages nothing** |
-| `run` | full cycle; **stages** a proposal; nothing live changes |
-| `adopt` | apply the staged proposal to `CLAUDE.md`/`SKILL.md` (backs up first) |
-| `harvest` | debug: print the recurring tasks it mined |
-| `schedule` / `unschedule` | install/remove the nightly cron entry |
+| `status` | show state and the latest staged proposal |
+| `dry-run` | harvest, mine, replay, and report; stage nothing |
+| `run` | run the full cycle and stage a proposal |
+| `adopt` | apply the latest staged proposal, with backups |
+| `harvest` | inspect or export mined tasks |
+| `schedule` / `unschedule` | install or remove the managed nightly cron entry |
 
-| Flag | Default | Meaning |
+Common implemented flags include:
+
+| Flag | Default | Purpose |
 |---|---|---|
-| `--backend mock\|claude\|codex\|copilot` | `mock` | who runs/optimizes (mock = free) |
-| `--preferences "..."` | – | your house rules, as a prior |
-| `--gate on\|off` | `on` | strict held-out gate vs. greedy |
-| `--rollouts-k K` | `1` | multi-rollout contrastive reflection |
-| `--optimizer-model` / `--target-model` | – | split the optimizer from the target |
-| `--budget-tokens` / `--budget-minutes` | – | cap the nightly spend |
-| `--scope invoked\|all` | `invoked` | this project only, or all projects |
-| `--auto-adopt` | off | apply without manual review (power users) |
+| `--backend mock\|claude\|codex\|cursor\|copilot\|handoff\|azure_openai` | `mock` | select who performs model calls |
+| `--model NAME` | backend default | select a backend-specific model |
+| `--source claude\|codex\|cursor\|auto` | `claude` | select the transcript source; `auto` retains Codex-then-Claude precedence and does not select Cursor |
+| `--cursor-home PATH` | `~/.cursor` | override the Cursor transcript home |
+| `--cursor-path PATH` | auto-detect `cursor-agent` | select the Cursor Agent CLI executable |
+| `--project PATH` | current directory | select the project and invoked harvest scope |
+| `--scope invoked\|all` | `invoked` | limit transcript harvesting |
+| `--target-skill-path PATH` | managed skill | select a specific `SKILL.md` to stage/adopt |
+| `--tasks-file PATH` | none | replay a reviewed task file instead of harvesting |
+| `--max-sessions N` / `--max-tasks N` | unset → `3 × tasks` / `40` tasks | bound harvested work; these are not hard token or wall-clock budgets |
+| `--edit-budget N` | `4` | cap bounded edits per cycle |
+| `--preferences "..."` | empty | add house rules to the reflection prior |
+| `--progress` | off | print phase progress to stderr |
+| `--auto-adopt` | off | adopt an accepted proposal without a separate command |
+| `--json` | off | emit machine-readable output where supported |
 
-Deep dive: [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).
+The nightly CLI does **not** currently expose `--gate`, `--rollouts-k`,
+`--optimizer-model`, `--target-model`, `--budget-tokens`, or `--budget-minutes`.
+Do not pass experiment-harness flags to the main CLI.
 
----
+For the Cursor backend, `--project` also selects target files, state, and the
+staging location, but it does not make that directory the Cursor Agent execution
+workspace. The target skill is inserted as prompt text rather than invoked as a
+native skill. Real-backend `dry-run` performs the same mining and replay model
+calls while suppressing staging, adoption, and persisted state changes. The
+current Sleep cycle does not implement fresh-worktree replay; a `replay: mock`
+report label describes prompt replay and is independent of `--backend mock`.
 
-## Does it actually work?
+### Preferences
 
-Yes — measured with **real models on both Claude and Codex**, scored on held-out
-tasks the optimizer never trained on:
+`--preferences` is the main user-facing steering knob:
 
-- **gbrain-evals `skillopt-v1`** (the public suite gbrain scores SkillOpt on):
-  deficient skills go **0.00 → 1.00** on all 4 seeds, including a real tool-use
-  loop; cross-model transfer is positive; the gate blocks regressions.
-  → [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep)
-- **Academic daily-cases** (math / spreadsheet / search-QA, the paper's 4:1:5
-  split with dream-augmented train): see
-  [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep).
-- **Fresh load-test** (a "SQL must always include LIMIT" analyst, built from
-  scratch): held-out **0.00 → 1.00** on both backends.
-  → [the SkillOpt-Sleep guide section](https://microsoft.github.io/SkillOpt/docs/guideline.html#sleep)
-
-Try the deterministic proof yourself (no API key, no spend):
 ```bash
-python -m skillopt_sleep.experiments.run_experiment --persona researcher --assert-improves
+python -m skillopt_sleep run --backend codex --project "$(pwd)" \
+  --preferences "Prefer pytest. Keep commit subjects imperative and concise."
 ```
-It prints the held-out score rising to 1.0 as the gate accepts the right rules,
-and confirms the gate **rejects** an injected harmful edit.
 
----
+Preferences guide reflection but remain subject to the validation gate.
 
-## Safety
+### Cursor source and backend
 
-- **Read-only** harvest of your sessions. `mock` replay has no side effects.
-- Proposals are **staged**, never auto-applied (unless you opt in with `--auto-adopt`).
-- Every adopt writes a backup. Per-night token/time budget caps. Secrets redacted.
+Cursor transcript harvesting is explicit: use `--source cursor` rather than
+`--source auto`. Invoked-project scope uses Cursor's recorded workspace path,
+with the sanitized storage directory as a fallback; `--scope all` scans every
+Cursor workspace under `~/.cursor/projects`. The model-driven backend requires
+an installed, authenticated `cursor-agent`; use `--cursor-path`,
+`SKILLOPT_SLEEP_CURSOR_PATH`, or the `cursor_path` config key when it is not on
+`PATH`, and use `--model` or `SKILLOPT_SLEEP_CURSOR_MODEL` to choose a model.
+
+Target the project skill explicitly so accepted learning becomes visible to
+Cursor without changing the plugin's own workflow skill:
+
+```bash
+python -m skillopt_sleep run --project "$(pwd)" \
+  --source cursor --backend cursor \
+  --target-skill-path .cursor/skills/skillopt-sleep-learned/SKILL.md \
+  --max-sessions 5 --max-tasks 3 --progress
+```
+
+### Advanced config
+
+The JSON/YAML config under `~/.skillopt-sleep/` supports additional engine keys,
+including `gate_mode`, `gate_metric`, `dream_rollouts`, `dream_factor`, `recall_k`,
+`evolve_memory`, and `evolve_skill`. These are config keys, not aliases for the
+unsupported CLI flags listed above. Shipping defaults are conservative:
+`gate_mode="on"`, `dream_rollouts=1`, `dream_factor=0`, and `recall_k=0`.
+
+The managed `schedule` command stores only the project, backend, time, and
+optional auto-adopt setting. It does not copy `--source`, `--cursor-home`,
+`--cursor-path`, `--model`, or `--target-skill-path` into the scheduled command.
+For a Cursor schedule, set `transcript_source`, `cursor_home`, `cursor_path`,
+`model`, and `target_skill_path` in `~/.skillopt-sleep/config.json` first. Keep
+the target project-relative, use an absolute CLI path because cron and Task
+Scheduler may have a minimal `PATH`, and confirm that `cursor-agent` is
+authenticated for the account that runs the job.
+
+### Handoff backend
+
+`--backend handoff` keeps model subprocesses out of the engine. It writes pending
+model calls to `.skillopt-sleep-handoff/PROMPTS.md` and `pending.json`, exits with
+code 3, and resumes after answers are placed in `answers/<id>.md`:
+
+```bash
+python -m skillopt_sleep run --backend handoff --project "$(pwd)"
+# answer each prompt in a fresh context, then run the same command again
+```
+
+Answering held-out prompts from a context that has already seen their references
+contaminates the validation gate. Claude Code's `/skillopt-sleep-handoff` command
+automates the loop with isolated fresh-context subagents.
+
+## Validation
+
+The deterministic no-provider check exercises consolidation and the gate:
+
+```bash
+python -m skillopt_sleep.experiments.run_experiment \
+  --persona researcher --assert-improves
+```
+
+Real-model benchmark results and their limitations are documented in
+[`docs/sleep/RESULTS.md`](../docs/sleep/RESULTS.md). The benchmark recipes are not
+the shipping CLI defaults.
+
+## Safety summary
+
+- Session harvesting is read-only.
+- `mock` replay makes no provider calls.
+- `run` stages proposals; `adopt` is the normal live-change boundary.
+- Adoption backs up existing target files.
+- `--max-sessions` and `--max-tasks` bound work, but the main CLI does not yet
+  enforce a hard token or elapsed-time budget.
+- Treat real-backend transcript excerpts as data shared with the selected
+  provider.

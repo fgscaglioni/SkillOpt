@@ -24,6 +24,8 @@ model:
   claude_code_exec_use_sdk: auto
   claude_code_exec_effort: medium
   claude_code_exec_max_thinking_tokens: 16384
+  cursor_exec_path: ""       # blank uses CURSOR_EXEC_PATH or cursor-agent
+  cursor_exec_sandbox: ""    # blank uses CURSOR_EXEC_SANDBOX or enabled
   codex_trace_to_optimizer: true
   azure_openai_endpoint: ""           # e.g. "https://your-resource.openai.azure.com/"
   azure_openai_api_version: "2024-12-01-preview"
